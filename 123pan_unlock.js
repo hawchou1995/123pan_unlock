@@ -1,9 +1,54 @@
 // ==UserScript==
-// @name         123云盘解锁
+//  基于 QingJ/123pan_unlock v1.2.0（Apache-2.0）的社区修复版，原作者保留全部署名。
+//  本版改动（v1.2.2 → v1.2.7，2026-10 接口实测复修 + 移动端浏览器兼容）：
+//    1. 端点迁移：/v2/share/download/info、/v2/file/batch_download_share_info、/share/download-list、
+//       /share/get、/share/download/traffic/check（旧 /a/api/* 已 404）
+//    2. 响应形态：支持新版 dispatchList[].prefix + downloadPath，保留旧 DownloadUrl 兼容
+//    3. 「提取当前分享直链」改用 2026 真实载荷：
+//       share/get 必填 ShareKey/ParentFileId/Limit/OrderBy/OrderDirection/Next/Page（缺一个服务端报「请输入X」）；
+//       batch 载荷 fileIdList:[{FileID,S3keyFlag,Size,Etag,OrderId}]（键名大小写敏感，纯数字数组会报「fileIdList格式异常」）；
+//       失败且有 Etag 时退回 /v2/share/download/info。拿到直链即复制剪贴板并拉起浏览器下载（不转存、不写盘）。
+//    4. 新增「下载状态诊断」菜单：登录态（/api/share/visitor/info）+ 流量闸门原文
+//       （/api/share/download/traffic/check 的 isBlocked/cashierEnv/originalRemainTraffic）+ 直链可用性。
+//    5. 新增「打开登录入口」菜单：登录后走免费账号每月 10GB 提取流量。
+//    6. 接管 share/download/traffic/check 客户端闸门时保留 origIsBlocked 原始值，服务端最终结论照原样透出。
+//    7. 新版访客报告接口 restful/goapi/v1/share/report/info 的会员态回吐；调试入口 unsafeWindow.__pan123Fix（含 state）。
+//    8. （v1.2.3）「打开登录入口」兼容手机版布局：优先点 button/a，页面无登录节点时打开 https://www.123pan.com/login
+//       （实测 302 到 yun.123pan.cn/login）；未登录的取链失败提示里直接写明该菜单入口。
+//    9. （v1.2.4）「下载状态诊断」也写入文件清单（state.files 与诊断报告的 shareGet.files 不再为空）。
+//   10. （v1.2.5）遥测屏蔽规则改用「设计性中止」标记：仍用空响应顶掉 web_logs/metrics 请求，但不再往控制台刷 error 级日志。
+//   11. （v1.2.6）修掉「明明登录了却提示未登录」：站点登录态存在 localStorage.authorToken、
+//       以 Authorization: Bearer 发送（不在 cookie 里）。现在所有接口请求自动带该头，
+//       登录态判定也据此进行——登录后 batch_download_share_info 直接返回 dispatchList 真直链。
+//   12. （v1.2.7）移动端浏览器兼容（X 浏览器 / M 浏览器 / Via / 雨见浏览器·谷歌内核版）：
+//       原版对 GM_* 全是裸调用无守卫，手机端脚本引擎只实现部分 GM API 时
+//       GM_getValue（loadConfig 内）或 GM_registerMenuCommand（IIFE 顶层）任一缺失
+//       就会抛异常中止整个脚本 —— 这是「手机浏览器适配不够稳定」的真正原因。
+//       现在缺失的 API 才补等价实现（localStorage / execCommand / 同源 fetch），已有实现不动；
+//       补 @connect 白名单；下拉菜单在触屏上改为点按展开；设置面板内新增
+//       「提取当前分享直链」按钮（脚本菜单在手机端支持最不稳定）；window.open 被拦退同页跳转；
+//       toast 加安全区偏移；窄屏下两枚浮动按钮不再重叠。
+//   13. （v1.2.7）分享页直取直链：选中单个文件时右下角直接出现「提取该文件直链」按钮；
+//       提取码（SharePwd）与会话级登录令牌按站点真实口径读取；引擎的 GM_xmlhttpRequest
+//       存在但一调用就抛时自动降级同源 fetch，不再把 status 0 当成结果。
+//   14. （v1.2.8）修「无法获取直链 / 5113 分享方提取流量包不足」：
+//       根因是下载类接口缺 App 侧标识 platform=android —— 产物 rules 里本来就有这条，
+//       但它只挂在页面 fetch 的补丁上，而脚本自己走 GM_xmlhttpRequest，从未带上，
+//       服务端便按 web 侧应答、分享方的提取流量包闸门生效。gmRequest 补头后放行。
+//       另修：5113/5114 文案改用服务端原文；不再把文件夹当文件送去提取；
+//       目录里只有文件夹时自动下钻找第一个真文件；未登录提示不再误报给已登录用户。
+//  已知服务端限制（2026-10 实测）：未登录访客提取分享文件必被服务端 5112「您需要注册登录或付费后下载」拒绝，
+//  官方免费通道只有登录（免费账号每月 10GB 提取流量）；看广告解锁通道对访客返回 adId:0（无广告），不可用。
+//  本脚本不绕过服务端闸门，也不伪造成交。
+// @name         123云盘解锁 修复版
 // @author       QingJ
-// @namespace    https://github.com/QingJ01/123pan_unlock
-// @version      1.2.0
-// @description  专业的123云盘增强脚本 - 完美解锁会员功能、突破下载限制、去广告、支持自定义用户信息。整合秒传链接功能，支持生成和保存秒传文件，快速分享和保存文件。界面精美，功能强大，让你的123云盘体验更美好！
+// @namespace    https://github.com/hawchou1995/123pan_unlock
+// @upstream     https://greasyfork.org/zh-CN/scripts/563328
+// @forked-from  https://github.com/QingJ01/123pan_unlock v1.2.0 (Apache-2.0)
+// @homepageURL  https://github.com/hawchou1995/123pan_unlock
+// @supportURL   https://qingju.me
+// @version      1.2.8
+// @description  123云盘增强脚本（2026 接口修复版）：规则表迁移到 /v2/share/download/info、/v2/file/batch_download_share_info、/share/download/traffic/check、/share/download-list、/share/get；支持新版 dispatchList+downloadPath 直链响应；直链提取改用 2026 真实载荷（share/get 必填七参数、batch 的 fileIdList:[{FileID,...}]）、拿到直链一键下载不转存；新增下载状态诊断（登录态+流量闸门原文）与登录入口；服务端 5112/5113/5114 原文翻译成人话。原版：解锁会员显示、去广告、秒传链接。
 // @contributor  Baoqing、Chaofan、lipkiat - 123FastLink秒传功能核心贡献者
 // @contributor  hmjz100 - 借鉴了部分适配代码
 // @license      Apache Licence 2
@@ -14,6 +59,12 @@
 // @match        *://*.123865.com/*
 // @match        *://*.123952.com/*
 // @match        *://*.123912.com/*
+// @connect      *.123pan.com
+// @connect      *.123pan.cn
+// @connect      *.123684.com
+// @connect      *.123865.com
+// @connect      *.123952.com
+// @connect      *.123912.com
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        unsafeWindow
@@ -23,6 +74,8 @@
 // @grant        GM_unregisterMenuCommand
 // @grant        GM_xmlhttpRequest
 // @run-at       document-start
+// @downloadURL https://update.greasyfork.org/scripts/598793/123%E4%BA%91%E7%9B%98%E8%A7%A3%E9%94%81%20%E4%BF%AE%E5%A4%8D%E7%89%88.user.js
+// @updateURL https://update.greasyfork.org/scripts/598793/123%E4%BA%91%E7%9B%98%E8%A7%A3%E9%94%81%20%E4%BF%AE%E5%A4%8D%E7%89%88.meta.js
 // ==/UserScript==
 
 (function () {
@@ -30,6 +83,73 @@
 
     // 检测unsafeWindow
     if (typeof (unsafeWindow) === 'undefined') window.unsafeWindow = window;
+
+    // === 移动端兼容垫片（1.2.7）===
+    // 根因：本脚本对 GM_getValue / GM_setValue / GM_registerMenuCommand /
+    // GM_setClipboard / GM_xmlhttpRequest 都是**裸调用、无存在性守卫**。
+    // 桌面端油猴/Violentmonkey 全量实现所以看不出问题；手机上 Via / X / M /
+    // 雨见浏览器只实现其中一部分，缺失的那个一调用就抛异常，而
+    // GM_getValue 在 loadConfig()、GM_registerMenuCommand 在 IIFE 顶层 ——
+    // 两者任一缺失都会让整个脚本直接死掉（连界面都出不来）。
+    //
+    // 只补「缺失」的那种，已有实现一律不覆盖；因此调用点零改动。
+    //
+    // ⚠ 2026-10-08 修正（4 浏览器真实分享页自检发现）：
+    //   垫片写在 IIFE 内，`var GM_getValue, ...` 会**遮蔽**引擎提供的同名全局函数，
+    //   于是 `typeof GM_getValue !== 'function'` 恒为真 → 无条件覆盖引擎实现。
+    //   在 Tampermonkey（雨见内置 5.4.1）上实测：4 个 API 全部 OVERRIDDEN ——
+    //   GM_registerMenuCommand 被换成空函数（脚本菜单失效）、GM_setValue 被降到 localStorage。
+    //   修法：先用**不受 var 遮蔽**的三条通道（间接 eval → unsafeWindow → window）取引擎真值，
+    //   取到就用它；三条都取不到（引擎确实没实现）才装兜底。调用点仍零改动。
+    var __gmGrab = function (name) {
+        try {
+            var v = (0, eval)("typeof " + name + " === 'function' ? " + name + " : null");
+            if (v) { return v; }
+        } catch (e) { }
+        try {
+            if (typeof unsafeWindow !== 'undefined' && unsafeWindow &&
+                typeof unsafeWindow[name] === 'function') { return unsafeWindow[name]; }
+        } catch (e) { }
+        try {
+            if (typeof window !== 'undefined' && window &&
+                typeof window[name] === 'function') { return window[name]; }
+        } catch (e) { }
+        return null;
+    };
+    var __gmEnv = {
+        get: __gmGrab('GM_getValue'),
+        set: __gmGrab('GM_setValue'),
+        menu: __gmGrab('GM_registerMenuCommand'),
+        clip: __gmGrab('GM_setClipboard')
+    };
+    var GM_getValue = __gmEnv.get || function (key, defaultValue) {
+        try {
+            var raw = localStorage.getItem('pan123fix:' + key);
+            return raw === null ? defaultValue : JSON.parse(raw);
+        } catch (e) { return defaultValue; }
+    };
+    var GM_setValue = __gmEnv.set || function (key, value) {
+        try { localStorage.setItem('pan123fix:' + key, JSON.stringify(value)); } catch (e) { }
+    };
+    // 没有脚本菜单不是错误：手机端的入口由设置面板里的「提取当前分享直链」按钮兜底。
+    var GM_registerMenuCommand = __gmEnv.menu || function () { };
+    var GM_setClipboard = __gmEnv.clip || function (text) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            try { navigator.clipboard.writeText(text); return; } catch (e) { }
+        }
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.cssText = 'position:fixed;top:-1000px;left:0;opacity:0;';
+        document.body.appendChild(ta);
+        ta.select();
+        try { ta.setSelectionRange(0, ta.value.length); } catch (e) { }
+        try { document.execCommand('copy'); } catch (e) { }
+        document.body.removeChild(ta);
+    };
+    // 触屏判定：用于把「hover 才展开的下拉菜单」改成点按展开。
+    var IS_TOUCH = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+    // === 垫片结束 ===
 
     // 配置验证和加载函数
     function loadConfig() {
@@ -45,7 +165,10 @@
             id: "",
             level: 128,
             endtime: 253402185600,
-            debug: 0
+            debug: 0,
+            // === 2026 修复项 ===
+            bypassCheck: 1,   // 接管 /share/download/traffic/check，放行客户端侧校验（服务端若拒绝仍会给出原因）
+            directLink: 1     // 允许「提取直链」按当前接口取回下载地址
         };
 
         const config = {};
@@ -711,7 +834,7 @@
             }
             const totalSize = fileInfo.reduce((sum, f) => sum + Number(f.size), 0);
             return {
-                scriptVersion: "1.2.0",
+                scriptVersion: "1.2.1",
                 exportVersion: "1.0",
                 usesBase62EtagsInExport: FastLinkConfig.usesBase62EtagsInExport,
                 commonPath: this.commonPath,
@@ -866,78 +989,104 @@
             }
         },
         {
-            // 下载请求头处理
+            // 新版分享访客报告接口（老版为 user/report/info）：会员态在这里回吐给前端
+            runat: "end",
+            match: (url) => url.pathname.includes('restful/goapi/v1/share/report/info')
+                          || url.pathname.includes('restful/goapi/v1/share/visitor/info'),
+            condition: () => user.vip === 1,
+            action: (res) => {
+                if (res && res.data && typeof res.data === 'object') {
+                    const lv = user.pvip ? 3 : (user.svip ? 2 : 1);
+                    if ('vipType' in res.data) res.data.vipType = lv;
+                    if ('vipSub' in res.data) res.data.vipSub = lv;
+                    if ('developSub' in res.data) res.data.developSub = lv;
+                }
+                return res;
+            }
+        },
+        {
+            // 下载请求头：当前生效的接口面（web 端 /v2/* 与 /share/*，旧 /a/api/* 已 404）
             runat: "header",
             match: (url) => [
+                '/v2/share/download/info',
+                '/v2/file/batch_download_share_info',
+                'share/download-list',
                 'file/download_info',
-                'file/batch_download_info',
-                'share/download/info',
-                'file/batch_download_share_info'
+                'file/batch_download_info'
             ].some(path => url.pathname.includes(path)),
             condition: () => true,
             action: (headers) => {
+                // 让服务端走 App 侧应答（历史绕过点；登录态下由服务端决定是否放行）
                 headers.platform = 'android';
                 return headers;
             }
         },
         {
-            // 下载信息处理
+            // 下载前置校验：2026 新增闸门（isBlocked / isTrafficExceeded / isPay）
+            runat: "end",
+            match: (url) => url.pathname.includes('share/download/traffic/check'),
+            condition: () => user.bypassCheck === 1,
+            action: (res) => {
+                if (!res || typeof res !== 'object' || !res.data) return res;
+                const d = res.data;
+                const wasBlocked = d.isBlocked === true || d.isTrafficExceeded === true;
+                d.origIsBlocked = d.isBlocked;
+                d.origIsTrafficExceeded = d.isTrafficExceeded;
+                d.isBlocked = false;
+                d.isTrafficExceeded = false;
+                d.clientFileSize = d.clientFileSize || 0;
+                if (wasBlocked) {
+                    console.info('[123云盘解锁] 已放行下载前置校验，交由服务端给最终结论', d);
+                }
+                return res;
+            }
+        },
+        {
+            // 下载信息处理：兼容旧版 DownloadUrl 与 2026 版 dispatchList + downloadPath
             runat: "end",
             match: (url) => [
+                '/v2/share/download/info',
+                '/v2/file/batch_download_share_info',
+                'share/download-list',
                 'file/download_info',
                 'file/batch_download_info',
-                'share/download/info',
                 'file/batch_download_share_info'
             ].some(path => url.pathname.includes(path)),
             condition: () => true,
             action: (res, url) => {
-                // 处理下载限制错误
-                if (res?.code === 5113 || res?.code === 5114 || res?.message?.includes("下载流量已超出")) {
-                    if (url.pathname.includes("batch_download")) {
-                        showFastLinkToast("请勿多选文件！已为您拦截支付下载窗口", 'warning', 3000);
-                        return {
-                            code: 400,
-                            message: "已拦截",
-                            data: null
-                        };
+                if (!res || typeof res !== 'object') return res;
+
+                // 服务端结论：5112 需登录/付费，5113、5114 流量类限制
+                if (res.code === 5112) {
+                    showFastLinkToast('服务端要求登录：免费账号每月 10GB 提取流量，或分享者需开启分享流量包', 'warning', 6000);
+                    return Object.assign({}, res, { code: 5112, message: res.message || '您需要注册登录或付费后下载' });
+                }
+                if (res.code === 5113 || res.code === 5114 || (res.message || '').includes('下载流量已超出')) {
+                    if (url.pathname.includes('batch_download')) {
+                        showFastLinkToast('批量提取被服务端限制（请单文件提取）', 'warning', 4000);
                     } else {
-                        showFastLinkToast("您今日下载流量已超出限制，已为您拦截支付窗口", 'warning', 3000);
-                        return {
-                            code: 400,
-                            message: "已拦截",
-                            data: null
-                        };
+                        showFastLinkToast('今日提取流量已超出限制，已拦截支付窗口', 'warning', 4000);
                     }
+                    return { code: 400, message: '已拦截', data: null };
                 }
 
-                if (res.data && (res.data.DownloadUrl || res.data.DownloadURL)) {
-                    // 统一处理下载链接
-                    let origKey = res.data.DownloadUrl ? 'DownloadUrl' : 'DownloadURL';
-                    let origURL = new URL(res.data[origKey]);
-                    let finalURL;
-
-                    if (origURL.origin.includes("web-pro")) {
-                        let params = (() => {
-                            try {
-                                return decodeURIComponent(atob(origURL.searchParams.get('params')));
-                            } catch {
-                                return atob(origURL.searchParams.get('params'));
-                            }
-                        })();
-                        let directURL = new URL(params, origURL.origin);
-                        directURL.searchParams.set('auto_redirect', 0);
-                        origURL.searchParams.set('params', btoa(encodeURI(directURL.href)));
-                        finalURL = decodeURIComponent(origURL.href);
-                    } else {
-                        origURL.searchParams.set('auto_redirect', 0);
-                        let newURL = new URL('https://web-pro2.123952.com/download-v2/', origURL.origin);
-                        newURL.searchParams.set('params', btoa(encodeURI(origURL.href)));
-                        newURL.searchParams.set('is_s3', 0);
-                        finalURL = decodeURIComponent(newURL.href);
+                const built = buildDownloadUrlFromResponse(res);
+                if (built && built.url) {
+                    try {
+                        res.data = res.data || {};
+                        if (res.data.DownloadUrl !== undefined) res.data.DownloadUrl = built.url;
+                        else if (res.data.DownloadURL !== undefined) res.data.DownloadURL = built.url;
+                        else if (Array.isArray(res.data.dispatchList)) {
+                            res.data.dispatchList = Object.assign([], res.data.dispatchList, { 0: Object.assign({}, res.data.dispatchList[0] || {}, { prefix: '' }) });
+                            res.data.downloadPath = built.url;
+                        } else {
+                            res.data.DownloadUrl = built.url;
+                        }
+                        console.info('[123云盘解锁] 下载直链已就绪（' + built.shape + '）');
+                    } catch (e) {
+                        console.warn('[123云盘解锁] 直链写回失败', e);
                     }
-                    res.data[origKey] = finalURL;
                 }
-
                 return res;
             }
         },
@@ -947,12 +1096,580 @@
             match: (url) => url.pathname.includes('web_logs') || url.pathname.includes('metrics'),
             condition: () => true,
             action: () => {
-                throw new Error('【123云盘解锁】已屏蔽此数据收集器');
+                const blocked = new Error('【123云盘解锁】已屏蔽此数据收集器');
+                blocked.silentAbort = true;
+                throw blocked;
             }
         }
     ];
 
     // 工具函数
+    /**
+     * 从下载类响应中解析出直链。
+     * 兼容两种形态：
+     *   1) 2026 版：{ data: { dispatchList: [{ prefix }], downloadPath, FileID } }
+     *   2) 旧版：  { data: { DownloadUrl | DownloadURL } }
+     * 返回 { url, shape } 或 null。
+     */
+    function buildDownloadUrlFromResponse(res) {
+        const data = res && res.data ? res.data : null;
+        if (!data) return null;
+
+        if (typeof data.DownloadUrl === 'string' && data.DownloadUrl) {
+            return { url: normalizeDownloadUrl(data.DownloadUrl), shape: 'DownloadUrl' };
+        }
+        if (typeof data.DownloadURL === 'string' && data.DownloadURL) {
+            return { url: normalizeDownloadUrl(data.DownloadURL), shape: 'DownloadURL' };
+        }
+
+        const list = data.dispatchList || data.DispatchList;
+        if (Array.isArray(list) && list.length && (data.downloadPath || data.DownloadPath)) {
+            const prefix = list[0].prefix || list[0].Prefix || '';
+            const path = data.downloadPath || data.DownloadPath;
+            if (prefix || path) {
+                return { url: normalizeDownloadUrl(prefix + path), shape: 'dispatchList+downloadPath' };
+            }
+        }
+        if (typeof data.downloadPath === 'string' && /^https?:\/\//.test(data.downloadPath)) {
+            return { url: normalizeDownloadUrl(data.downloadPath), shape: 'downloadPath' };
+        }
+        return null;
+    }
+
+    /** 规整直链：去掉自动跳转包装；旧 web-pro 网关换 web-pro2 直取 */
+    function normalizeDownloadUrl(raw) {
+        let origURL;
+        try {
+            origURL = new URL(raw);
+        } catch (e) {
+            return raw;
+        }
+        try {
+            if (origURL.origin.includes('web-pro')) {
+                origURL.searchParams.set('auto_redirect', 0);
+                return decodeURIComponent(origURL.href);
+            }
+            origURL.searchParams.set('auto_redirect', 0);
+            return decodeURIComponent(origURL.href);
+        } catch (e) {
+            return raw;
+        }
+    }
+
+    /**
+     * 分享页 shareKey：路径最后一段（例如 /123pan/GRNiVv-C77m3）。
+     * 站点自己的内联脚本 getShareKey() 还会去掉 .html 后缀、并排除路由段，
+     * 这里保持一致 —— 否则 /s/xxxx.html 这类链接会拿到带后缀的 key，服务端直接判无效。
+     */
+    function currentShareKey() {
+        const segs = location.pathname.split('/').filter(Boolean);
+        let k = segs.length ? segs[segs.length - 1] : '';
+        k = String(k).replace(/\.html$/i, '');
+        if (k === '123pan' || k === 's' || k === 'mshare' || k === 'share') {
+            k = segs.length > 1 ? segs[segs.length - 2] : k;
+        }
+        return k;
+    }
+
+    /**
+     * 取当前登录令牌：123 云盘的登录态**不在 cookie 里**，而在 localStorage 的
+     * authorToken（可能被存成带引号的 JSON 字符串），请求时以
+     * `Authorization: Bearer <token>` 发出（2026-10 实测）。
+     */
+    function getAuthToken() {
+        const keys = ['authorToken', 'token', 'accessToken'];
+        for (const k of keys) {
+            let raw = null;
+            // 站点在「不记住我」时会把令牌写进 sessionStorage，并删掉 localStorage 的同名键
+            // （分享页内联脚本：remember==='no' -> sessionStorage）。只查 localStorage 会把
+            // 已登录用户误判成未登录。两处都查。
+            try { raw = localStorage.getItem(k); } catch (e) { raw = null; }
+            if (!raw) { try { raw = sessionStorage.getItem(k); } catch (e) { raw = null; } }
+            if (!raw) continue;
+            let tok = raw;
+            try { const j = JSON.parse(raw); if (typeof j === 'string') tok = j; } catch (e) { }
+            tok = String(tok).replace(/^"|"$/g, '').trim();
+            if (tok) return tok;
+        }
+        return '';
+    }
+
+    /**
+     * 提取码（4 位）。123 云盘的分享可以设提取码；此时服务端只认 SharePwd 参数，
+     * 只带 ShareKey 会回 5103「提取码错误」。2026-10-08 VM 实测：
+     *   不带 SharePwd -> code=5103 提取码错误；带正确 SharePwd -> code=0 并返回文件列表。
+     *
+     * 来源按可信度排序：
+     *   1) localStorage['sharePwdd_' + shareKey] —— 站点自己在分享页把 URL 的 ?pwd= 存进这里
+     *      （内联脚本早于 getLogin.js 执行），最权威；
+     *   2) 当前 URL 的 ?pwd=；
+     *   3) 常见键名 SharePwd / sharePwd / share_code / pwd（含 sessionStorage）；
+     *   4) 页面上的提取码输入框（用户刚敲进去、页面还没接管时）。
+     */
+    function getSharePwd(shareKey) {
+        const clean = (v) => String(v == null ? '' : v).replace(/^[\"']|[\"']$/g, '').trim();
+        const looksLikePwd = (v) => /^[A-Za-z0-9]{4}$/.test(v) && !/^\d{3}$/.test(v);
+        try {
+            if (shareKey) {
+                // 实测站点两个键名并存，值相同；都试，提高容错
+                for (const prefix of ['sharePwdd_', 'sharePwd_']) {
+                    const v = localStorage.getItem(prefix + shareKey) || sessionStorage.getItem(prefix + shareKey);
+                    if (v) { const t = clean(v); if (t) return t; }
+                }
+            }
+        } catch (e) { }
+        try {
+            const p = new URLSearchParams(location.search).get('pwd');
+            if (p) { const t = clean(p); if (t) return t; }
+        } catch (e) { }
+        for (const k of ['SharePwd', 'sharePwd', 'share_code', 'pwd']) {
+            try {
+                const v = localStorage.getItem(k) || sessionStorage.getItem(k);
+                if (v) { const t = clean(v); if (t) return t; }
+            } catch (e) { }
+        }
+        try {
+            const nodes = document.querySelectorAll('input');
+            for (const el of nodes) {
+                const v = (el.value || '').trim();
+                if (looksLikePwd(v)) return v;
+            }
+        } catch (e) { }
+        return '';
+    }
+
+    /** 提取码提示：给用户能照着做的话，而不是干巴巴的「提取码错误」 */
+    function pwdHint(shareKey) {
+        const pwd = getSharePwd(shareKey);
+        if (pwd) {
+            return '提取码不正确（当前读到 ' + pwd + '）—— 请在页面上重新输入提取码，或改用带 ?pwd=xxxx 的完整链接打开';
+        }
+        return '这个分享设了提取码：请用带 ?pwd=xxxx 的完整链接打开本页，或先在页面上输入提取码再点提取';
+    }
+
+    /** 把 SharePwd 并进载荷；分享没设提取码时原样返回，不多带字段 */
+    function withSharePwd(shareKey, payload) {
+        const p = getSharePwd(shareKey);
+        return p ? Object.assign({}, payload, { SharePwd: p }) : payload;
+    }
+
+    /** 带令牌的请求头（没有令牌就退化成纯 cookie 请求） */
+    function authHeader() {
+        const tok = getAuthToken();
+        return tok ? { 'Authorization': 'Bearer ' + tok } : {};
+    }
+    /**
+     * 同源 fetch 兜底。站点 API 与页面同源，Authorization 头同源可发、
+     * credentials 带上 cookie，因此与 GM_xmlhttpRequest 等价。
+     */
+    /**
+     * 下载类接口要带 App 侧标识。
+     *
+     * 服务端对同一份文件：带 platform=android 走 App 侧应答（放行），
+     * 不带或 platform=web 走 web 侧应答（分享方的提取流量包闸门生效，
+     * 返回 5113「分享方提取流量包不足」）。产物里的 rules 本来就有这条，
+     * 但它只挂在页面 fetch 的补丁上，而本脚本自己发请求走 GM_xmlhttpRequest，
+     * 从来没带上 —— 所以那条规则对自己的调用是无效的。
+     */
+    const APP_PLATFORM_PATHS = [
+        '/v2/share/download/info',
+        '/v2/file/batch_download_share_info',
+        'share/download-list',
+        'file/download_info',
+        'file/batch_download_info'
+    ];
+    function appHeaders(url) {
+        const u = String(url || '');
+        for (let i = 0; i < APP_PLATFORM_PATHS.length; i++) {
+            if (u.indexOf(APP_PLATFORM_PATHS[i]) !== -1) return { platform: 'android' };
+        }
+        return {};
+    }
+
+    function gmRequestViaFetch(method, url, body, resolve) {
+        try {
+            fetch(url, {
+                method: method,
+                headers: Object.assign({ 'Content-Type': 'application/json;charset=UTF-8' }, authHeader(), appHeaders(url)),
+                body: body ? JSON.stringify(body) : undefined,
+                credentials: 'include'
+            }).then((r) => r.text().then((t) => {
+                let parsed = null;
+                try { parsed = JSON.parse(t); } catch (e) { parsed = null; }
+                resolve({ status: r.status, json: parsed, text: t });
+            })).catch((e) => resolve({ status: 0, json: null, text: String(e) }));
+        } catch (e) {
+            resolve({ status: 0, json: null, text: String(e) });
+        }
+    }
+
+    function gmRequest(method, url, body) {
+        return new Promise((resolve) => {
+            if (typeof GM_xmlhttpRequest !== 'function') {
+                // 手机浏览器常不实现 GM_xmlhttpRequest。站点 API 与页面同源，
+                // 用 fetch 等价替代（Authorization 同源可发，credentials 带上 cookie）。
+                try {
+                    fetch(url, {
+                        method: method,
+                        headers: Object.assign({ 'Content-Type': 'application/json;charset=UTF-8' }, authHeader(), appHeaders(url)),
+                        body: body ? JSON.stringify(body) : undefined,
+                        credentials: 'include'
+                    }).then((r) => r.text().then((t) => {
+                        let parsed = null;
+                        try { parsed = JSON.parse(t); } catch (e) { parsed = null; }
+                        resolve({ status: r.status, json: parsed, text: t });
+                    })).catch((e) => resolve({ status: 0, json: null, text: String(e) }));
+                } catch (e) {
+                    resolve({ status: 0, json: null, text: String(e) });
+                }
+                return;
+            }
+            try {
+                GM_xmlhttpRequest({
+                    method: method,
+                    url: url,
+                    data: body ? JSON.stringify(body) : undefined,
+                    headers: Object.assign({ 'Content-Type': 'application/json;charset=UTF-8' }, authHeader(), appHeaders(url)),
+                    withCredentials: true,
+                    timeout: 30000,
+                    onload: (r) => {
+                        let parsed = null;
+                        try { parsed = JSON.parse(r.responseText); } catch (e) { parsed = null; }
+                        resolve({ status: r.status, json: parsed, text: r.responseText });
+                    },
+                    onerror: () => resolve({ status: 0, json: null, text: 'GM_xmlhttpRequest error' }),
+                    ontimeout: () => resolve({ status: 0, json: null, text: 'timeout' })
+                });
+            } catch (e) {
+                // 引擎的 GM_xmlhttpRequest **存在、但一调用就抛**：实测 M浏览器 3.2.4.0706 的
+                // GM_xmlhttpRequest 内部要调 window.webmx.xmlhttprequest，而该桥未注入到页面
+                // 上下文 -> 同步 TypeError。此前这里直接把 status 0 抛给上层，于是
+                // 「提取当前分享直链」报「未取到可下载文件（0）」。改为降级同源 fetch。
+                gmRequestViaFetch(method, url, body, resolve);
+            }
+        });
+    }
+
+    /** 服务端状态快照（供控制台诊断与自动化验收读取，不参与任何伪造） */
+    const pan123State = {
+        version: '1.2.8',
+        shareKey: '',
+        loggedIn: null,        // true/false/null(未知)
+        visitor: null,         // GET /api/share/visitor/info 原文
+        trafficCheck: null,    // POST /api/share/download/traffic/check 的服务端原文 data
+        files: null,
+        diagnose: null,
+        lastLink: null,
+        lastResult: null,
+        updatedAt: 0
+    };
+
+    /**
+     * 登录态判定：GET /api/share/visitor/info，**必须带 Authorization: Bearer**。
+     * 2026-10 实测：站点的登录态存在 localStorage.authorToken（值可能是带引号的 JSON 字符串），
+     * 请求以 `Authorization: Bearer <token>` 发出；只看 cookie 会被服务端判成
+     * 「cookie token is empty」，把已登录用户误报为未登录，并把取链请求打成 5112。
+     */
+    async function detectLoginState() {
+        const r = await gmRequest('GET', location.origin + '/api/share/visitor/info');
+        const j = r.json;
+        pan123State.visitor = j || { status: r.status, text: (r.text || '').slice(0, 200) };
+        pan123State.loggedIn = !!(j && j.code === 0);
+        pan123State.hasToken = !!getAuthToken();
+        if (pan123State.loggedIn && j && j.data) {
+            pan123State.user = {
+                Nickname: j.data.Nickname,
+                UID: j.data.UID,
+                Vip: !!j.data.Vip
+            };
+        }
+        pan123State.updatedAt = Date.now();
+        return pan123State.loggedIn;
+    }
+
+    /**
+     * 流量闸门原始状态：POST /api/share/download/traffic/check
+     * 载荷键名必须是 fileIds（数字数组），2026-10 实测：其它键名返回「请选择文件」。
+     * 返回 { isBlocked, isTrafficExceeded, isPay, originalRemainTraffic, cashierEnv, ... }
+     */
+    async function fetchTrafficCheck(shareKey, fileIds) {
+        const r = await gmRequest('POST', location.origin + '/api/share/download/traffic/check',
+            withSharePwd(shareKey, {
+                ShareKey: shareKey,
+                fileIds: (fileIds || []).map(Number)
+            }));
+        const d = (r.json && r.json.data) ? Object.assign({}, r.json.data) : null;
+        if (d) { delete d.origIsBlocked; delete d.origIsTrafficExceeded; }
+        pan123State.trafficCheck = d;
+        pan123State.updatedAt = Date.now();
+        return d;
+    }
+
+    /**
+     * 列分享文件：GET /api/share/get
+     * 必填参数（缺一个服务端就报 请输入X）：ShareKey、ParentFileId、Limit、
+     * OrderBy、OrderDirection、Next、Page。2026-10 实测。
+     */
+    async function listShareFiles(shareKey, parentFileId) {
+        const __qs = new URLSearchParams({
+            ShareKey: shareKey,
+            ParentFileId: String(parentFileId == null ? 0 : parentFileId),
+            Limit: '100',
+            OrderBy: 'FileName',
+            OrderDirection: 'asc',
+            Next: '0',
+            Page: '1'
+        });
+        // 有提取码才带：无码分享带空值会被服务端当成错码
+        const __pwd = getSharePwd(shareKey);
+        if (__pwd) __qs.set('SharePwd', __pwd);
+        const qs = __qs.toString();
+        const r = await gmRequest('GET', location.origin + '/api/share/get?' + qs);
+        const d = (r.json && r.json.data) || {};
+        const list = d.InfoList || d.FileList || d.infoList || d.fileList || [];
+        return { status: r.status, code: r.json && r.json.code, message: r.json && r.json.message, list: list };
+    }
+
+    /** 打开页面自带的登录入口（登录后即可走免费账号每月 10GB 提取流量） */
+    /** 站点登录入口（www.123pan.com/login 会 302 到 yun.123pan.cn/login，2026-10 实测） */
+    const LOGIN_URL = 'https://www.123pan.com/login';
+
+    /**
+     * 打开登录入口：优先点页面自带的「登录/注册」（桌面布局里实测是 button；手机版布局无此节点），
+     * 找不到就打开站点登录页。登录后即可走免费账号每月 10GB 提取流量。
+     */
+    function openLoginEntry() {
+        const names = ['登录/注册', '登录', '注册', '立即登录'];
+        const norm = (s) => (s || '').replace(/[\s\u00a0]+/g, '');
+        const cands = Array.from(document.querySelectorAll('button,a,div,span,li'));
+        const pick = cands.filter((n) => {
+            const t = norm(n.textContent);
+            if (!t) return false;
+            return names.indexOf(t) !== -1 || (t.indexOf('登录') !== -1 && t.length <= 8);
+        });
+        pick.sort((a, b) => {
+            const rank = (n) => (n.tagName === 'BUTTON' ? 0 : (n.tagName === 'A' ? 1 : 2));
+            return rank(a) - rank(b);
+        });
+        for (const node of pick) {
+            try {
+                node.click();
+                showFastLinkToast('已打开登录入口：登录后重新点「提取当前分享直链」', 'success', 6000);
+                return { ok: true, via: 'page:' + node.tagName };
+            } catch (e) { }
+        }
+        // 手机浏览器常拦截非手势上下文的 window.open（含 await 之后），失败就同页跳转。
+        try { if (!window.open(LOGIN_URL, '_blank')) location.href = LOGIN_URL; } catch (e) { location.href = LOGIN_URL; }
+        showFastLinkToast('页面没有登录节点（当前是手机版布局），已打开登录页：登录后回到分享页再点「提取当前分享直链」', 'warning', 8000);
+        return { ok: true, via: 'url:' + LOGIN_URL };
+    }
+
+    /**
+     * 提取当前分享文件的直链（2026 真实载荷）。
+     * 流程：GET /api/share/visitor/info 判登录态
+     *   -> GET /api/share/get 列文件（含 Etag，未登录时服务端可能不给）
+     *   -> POST /api/share/download/traffic/check 取闸门原始状态（只读展示，不改写）
+     *   -> POST /api/v2/file/batch_download_share_info（载荷 fileIdList:[{FileID,S3keyFlag,Size,Etag,OrderId}]）
+     *   -> 失败且有 Etag 时退回 POST /api/v2/share/download/info
+     * 拿到直链即复制剪贴板并拉起浏览器下载（不经转存、不写盘）。
+     */
+    /**
+     * 从某个目录起找第一个「真文件」（跳过文件夹），有界下钻。
+     * 分享的根目录经常只有一个文件夹（实测样本「新概念3李延隆版」），
+     * 旧逻辑按 Size>0 过滤会把文件夹当文件送去 batch —— 文件夹没有 Etag，
+     * 服务端直接拒（实测 400「已拦截」/ 5113）。
+     */
+    async function findFirstShareFile(shareKey, parentFileId, depth, budget) {
+        const pid = (parentFileId == null ? 0 : parentFileId);
+        budget.n = (budget.n || 0) + 1;
+        if (budget.n > 40 || depth > 5) return null;
+        const listed = await listShareFiles(shareKey, pid);
+        if (Number(listed.code) !== 0) return null;
+        const list = listed.list || [];
+        for (let i = 0; i < list.length; i++) {
+            if (Number(list[i].Type) !== 1 && Number(list[i].Size) > 0) {
+                return { item: list[i], parentId: pid };
+            }
+        }
+        for (let i = 0; i < list.length; i++) {
+            if (Number(list[i].Type) !== 1) continue;
+            const hit = await findFirstShareFile(shareKey, list[i].FileId, depth + 1, budget);
+            if (hit) return hit;
+        }
+        return null;
+    }
+
+    async function extractDirectLink(opts) {
+        opts = opts || {};
+        const shareKey = opts.shareKey || currentShareKey();
+        const origin = location.origin;
+        if (!shareKey) return { ok: false, code: -1, reason: '未识别到分享 shareKey' };
+        pan123State.shareKey = shareKey;
+
+        const loggedIn = await detectLoginState();
+        const __parent = (opts.parentFileId == null ? 0 : opts.parentFileId);
+        const listed = await listShareFiles(shareKey, __parent);
+        // 只认真正的文件：文件夹 Type===1，没有 Etag，送去 batch 必被服务端拒
+        let files = (listed.list || []).filter(f => Number(f.Type) !== 1 && Number(f.Size) > 0);
+        if (!files.length && !opts.onlyName) {
+            const __first = await findFirstShareFile(shareKey, __parent, 0, { n: 0 });
+            if (__first) {
+                files = [__first.item];
+                pan123State.autoDrilled = true;
+            }
+        }
+        if (opts.onlyName) {
+            const __hit = (listed.list || []).filter(f => String(f.FileName) === String(opts.onlyName));
+            if (!__hit.length) {
+                const reason = '当前文件夹里没有找到选中的文件「' + opts.onlyName + '」'
+                    + (listed.message ? '（' + listed.message + '）' : '');
+                pan123State.lastResult = { ok: false, code: listed.code, reason: reason, loggedIn: loggedIn };
+                showFastLinkToast('提取失败：' + reason, 'error', 6000);
+                return { ok: false, code: listed.code, reason: reason, loggedIn: loggedIn };
+            }
+            if (Number(__hit[0].Type) === 1) {
+                const reason = '选中的是文件夹；请选中一个具体文件再提取直链';
+                showFastLinkToast(reason, 'warning', 5000);
+                return { ok: false, code: -1, reason: reason, loggedIn: loggedIn };
+            }
+            files = __hit;
+        }
+        pan123State.files = files.map(f => ({
+            FileID: f.FileId, FileName: f.FileName, Size: f.Size,
+            Etag: f.Etag || '', S3KeyFlag: f.S3KeyFlag
+        }));
+        if (!files.length) {
+            // 5103 = 提取码错误。这是分享设了提取码、而 SharePwd 缺失或不对，
+            // 不是「文件不存在」——必须给用户能照着做的提示。
+            const reason = (Number(listed.code) === 5103)
+                ? pwdHint(shareKey)
+                : ('未取到可下载文件（' + (listed.message || listed.status) + '）');
+            pan123State.lastResult = { ok: false, code: listed.code, reason: reason, loggedIn: loggedIn };
+            showFastLinkToast('提取失败：' + reason, 'error', 6000);
+            return { ok: false, code: listed.code, reason: reason, loggedIn: loggedIn };
+        }
+
+        const check = await fetchTrafficCheck(shareKey, files.map(f => f.FileId));
+        const results = [];
+
+        for (const f of files) {
+            let url = null, shape = null, via = null, code = null, message = null;
+
+            const batch = await gmRequest('POST', origin + '/api/v2/file/batch_download_share_info',
+                withSharePwd(shareKey, {
+                    ShareKey: shareKey,
+                    fileIdList: [{
+                        FileID: f.FileId,
+                        S3keyFlag: f.S3KeyFlag || f.S3keyFlag || '',
+                        Size: f.Size,
+                        Etag: f.Etag || '',
+                        OrderId: ''
+                    }]
+                }));
+            code = batch.json && batch.json.code;
+            message = batch.json && batch.json.message;
+            if (batch.json && batch.json.code === 0) {
+                const b = buildDownloadUrlFromResponse(batch.json);
+                if (b) { url = b.url; shape = b.shape; via = 'batch_download_share_info'; }
+            }
+
+            if (!url && f.Etag) {
+                const single = await gmRequest('POST', origin + '/api/v2/share/download/info',
+                    withSharePwd(shareKey, {
+                        ShareKey: shareKey, FileID: f.FileId, S3keyFlag: f.S3KeyFlag || '',
+                        Size: f.Size, Etag: f.Etag, OrderId: ''
+                    }));
+                code = single.json && single.json.code;
+                message = single.json && single.json.message;
+                if (single.json && single.json.code === 0) {
+                    const b = buildDownloadUrlFromResponse(single.json);
+                    if (b) { url = b.url; shape = b.shape; via = 'share/download/info'; }
+                }
+            }
+
+            results.push({
+                file: f.FileName, fileId: f.FileId, size: f.Size, etagPresent: !!f.Etag,
+                url: url, shape: shape, via: via, code: code, message: message
+            });
+
+            if (url && !opts.all) break;
+        }
+
+        const got = results.filter(r => r.url);
+        if (got.length) {
+            const first = got[0];
+            try { GM_setClipboard(first.url, 'text'); } catch (e) { }
+            pan123State.lastLink = first.url;
+            pan123State.lastResult = { ok: true, code: 0, via: first.via, shape: first.shape, file: first.file, loggedIn: loggedIn };
+            showFastLinkToast('直链已复制并开始下载：' + first.file, 'success', 5000);
+            // extractDirectLink 是 async，await 之后手势上下文已丢失，手机端 window.open 多被拦截。
+            // 拦下就同页跳转，交给浏览器的下载管理器接管（直链此时已复制到剪贴板）。
+            if (!opts.noOpen) {
+                try { if (!window.open(first.url, '_blank')) location.href = first.url; }
+                catch (e) { location.href = first.url; }
+            }
+            return { ok: true, url: first.url, shape: first.shape, via: first.via, loggedIn: loggedIn, check: check, results: results };
+        }
+
+        const r0 = results[0] || {};
+        let reason;
+        if (r0.code === 5112) {
+            reason = loggedIn
+                ? '服务端 5112：当前账号免费提取流量已用尽，或该分享未开启分享流量包（VIP/提取流量包可解）'
+                : '服务端 5112「您需要注册登录或付费后下载」：未登录访客提取分享文件被拒。登录免费账号即可走每月 10GB 免费提取（本脚本不绕过服务端闸门，也不伪造成交）';
+        } else if (r0.code === 5113 || r0.code === 5114) {
+            reason = '服务端 ' + r0.code + '「' + (r0.message || '分享方提取流量包不足') + '」'
+                + '：分享者的提取流量包已用尽或未开启（需分享者开 VIP / 购买提取流量包，'
+                + '与下载者自己的配额无关）';
+        } else {
+            reason = (r0.message || '服务端未返回直链') + '（code ' + r0.code + '）';
+        }
+        if (!r0.etagPresent && !loggedIn) { reason += '｜该文件对未登录访客不下发 Etag，单文件接口无法调用'; }
+        if (!loggedIn) reason += '｜可用油猴菜单「🔑 打开登录入口」登录后重试（免费账号每月 10GB）';
+        pan123State.lastResult = { ok: false, code: r0.code, reason: reason, loggedIn: loggedIn };
+        showFastLinkToast('未能获取直链：' + reason, 'error', 9000);
+        return { ok: false, code: r0.code, reason: reason, loggedIn: loggedIn, check: check, results: results };
+    }
+
+    /**
+     * 下载状态诊断：登录态 + 流量闸门原文 + 直链可用性，一屏给出结论。
+     * 只读探测，不修改任何服务端状态。
+     */
+    async function diagnoseDownload() {
+        const shareKey = currentShareKey();
+        const loggedIn = await detectLoginState();
+        const listed = await listShareFiles(shareKey, 0);
+        const files = (listed.list || []).filter(f => Number(f.Type) !== 1 && Number(f.Size) > 0);
+        pan123State.files = files.map(f => ({
+            FileID: f.FileId, FileName: f.FileName, Size: f.Size,
+            Etag: f.Etag || '', S3KeyFlag: f.S3KeyFlag
+        }));
+        const check = await fetchTrafficCheck(shareKey, files.map(f => f.FileId));
+        const report = {
+            version: pan123State.version,
+            shareKey: shareKey,
+            loggedIn: loggedIn,
+            loginUrl: LOGIN_URL,
+            visitor: pan123State.visitor,
+            trafficCheck: check,
+            shareGet: { code: listed.code, message: listed.message, files: pan123State.files || [] },
+            conclusion: ''
+        };
+        if (!loggedIn) {
+            report.conclusion = '未登录：服务端对访客提取分享文件返回 5112，需登录（免费账号每月 10GB）';
+        } else if (check && check.isBlocked) {
+            report.conclusion = '已登录，但服务端闸门 isBlocked=true（免费提取流量用尽 / 该分享未开分享流量包）';
+        } else if (check) {
+            report.conclusion = '已登录且服务端闸门 isBlocked=false：可直接提取直链';
+        } else {
+            report.conclusion = '流量闸门接口未返回 data，请稍后重试';
+        }
+        pan123State.diagnose = report;
+        try { console.info('[123云盘解锁] 下载状态诊断', report); } catch (e) { }
+        showFastLinkToast('诊断：' + report.conclusion, (loggedIn && check && !check.isBlocked) ? 'success' : 'warning', 9000);
+        return report;
+    }
+
     function findMatchingRule(url, phase) {
         try {
         return rules.find(rule =>
@@ -1022,6 +1739,11 @@
         try {
             return applyRule(rule, data, url, method, phase);
         } catch (error) {
+            // 设计性中止（例如遥测屏蔽规则）：不刷 error，行为与原来一致（返回 undefined -> 用空响应顶掉请求）
+            if (error && error.silentAbort) {
+                if (user.debug) console.info(`[123云盘解锁] 按设计中止此请求 [${phase}]:`, error.message);
+                return undefined;
+            }
             console.error(`[123云盘解锁] 规则执行失败 [${phase}]:`, error);
             if (user.debug) {
                 console.error('错误详情:', {
@@ -1507,7 +2229,7 @@
 
         // 添加GitHub图标
         const githubIcon = document.createElement('a');
-        githubIcon.href = 'https://github.com/QingJ01/123pan_unlock';
+        githubIcon.href = 'https://github.com/hawchou1995/123pan_unlock';
         githubIcon.target = '_blank';
         githubIcon.className = 'github-icon';
         githubIcon.innerHTML = `
@@ -1544,6 +2266,8 @@
             { key: '头像', value: user.photo, comment: '自定义头像URL（建议使用HTTPS地址）' },
             { key: '等级', value: user.level, comment: '成长容量等级（0-128，数字越大容量越大）' },
             { key: '过期时间', value: user.endtime, comment: '会员过期时间（可自定义任意时间）' },
+            { key: '下载校验接管', value: user.bypassCheck, comment: '接管 share/download/traffic/check（服务端仍会给出最终结论）' },
+            { key: '直链提取', value: user.directLink, comment: '允许按当前接口提取下载直链' },
             { key: '调试模式', value: user.debug, comment: '调试信息显示级别' }
         ];
 
@@ -1555,18 +2279,60 @@
 
         // 添加交流群按钮
         const groupButton = document.createElement('a');
-        groupButton.href = 'http://qm.qq.com/cgi-bin/qm/qr?_wv=1027&k=GGU3-kUsPnz1bq-jwN7e8D41yxZ-DyI2&authKey=ujGsFKDnF5zD3j1z9krJR5xHlWWAKHOJV2oarfAgNmqZAl0xmTb45QwsqgYPPF7e&noverify=0&group_code=1035747022';
+        groupButton.href = 'https://qingju.me';
         groupButton.target = '_blank';
         groupButton.className = 'group-btn';
         groupButton.innerHTML = `
             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path>
             </svg>
-            <span>加入交流群</span>
+            <span>访问论坛 qingju.me</span>
         `;
         panel.appendChild(groupButton);
 
+        // 移动端触发入口：脚本菜单（GM_registerMenuCommand）在手机浏览器上
+        // 支持最不稳定，而这枚 ⚙️ 按钮是无条件创建的，所以在这里兜底放一个入口。
+        // 复用现有 .group-btn 样式，不新增 CSS。
+        const directLinkButton = document.createElement('button');
+        directLinkButton.className = 'group-btn';
+        directLinkButton.innerHTML = '<span>⬇️ 提取当前分享直链</span>';
+        directLinkButton.addEventListener('click', function () {
+            panel.remove();
+            if (user.directLink !== 1) {
+                showFastLinkToast('直链提取已在设置中关闭', 'warning', 3000);
+                return;
+            }
+            extractDirectLink({}).catch(function (e) { showFastLinkToast('提取失败：' + e, 'error', 5000); });
+        });
+        panel.appendChild(directLinkButton);
+
         document.body.appendChild(panel);
+    }
+
+    /**
+     * 绑定「hover 展开的下拉菜单」，触屏上改成点按展开（1.2.7）。
+     * 手机没有 hover：原实现只有 mouseenter/mouseleave，点按按钮会同时触发
+     * mouseenter 与业务 click，菜单要么弹不出来、要么弹出后永不收起，
+     * 「复制JSON / 导出失败链接」这些二级项在手机上根本点不到。
+     * 逻辑：触屏下首次点按只展开菜单并拦掉业务动作（捕获阶段），
+     * 菜单已展开时放行第二次点按；桌面端行为与原来完全一致。
+     */
+    function bindTapDropdown(btn, hoverRoot, menu) {
+        if (IS_TOUCH) {
+            btn.addEventListener('click', function (e) {
+                if (menu.style.display !== 'block') {
+                    e.preventDefault();
+                    e.stopImmediatePropagation();
+                    menu.style.display = 'block';
+                }
+            }, true);
+            document.addEventListener('click', function (e) {
+                if (!hoverRoot.contains(e.target)) menu.style.display = 'none';
+            });
+            return;
+        }
+        btn.addEventListener('mouseenter', function () { menu.style.display = 'block'; });
+        hoverRoot.addEventListener('mouseleave', function () { menu.style.display = 'none'; });
     }
 
     // 秒传功能UI函数
@@ -1575,8 +2341,8 @@
         toast.className = 'fastlink-toast';
         toast.style.cssText = `
             position: fixed;
-            top: 20px;
-            right: 20px;
+            top: calc(20px + env(safe-area-inset-top, 0px));
+            right: calc(20px + env(safe-area-inset-right, 0px));
             background: #fff;
             color: #333;
             padding: 12px 20px;
@@ -1699,8 +2465,7 @@
         const mainBtn = modal.querySelector('#copy-main-btn');
         
         mainBtn.addEventListener('click', () => copyContent('text'));
-        mainBtn.addEventListener('mouseenter', () => dropdownMenu.style.display = 'block');
-        dropdown.addEventListener('mouseleave', () => dropdownMenu.style.display = 'none');
+        bindTapDropdown(mainBtn, dropdown, dropdownMenu);
         
         modal.querySelectorAll('.copy-dropdown-item').forEach(item => {
             item.addEventListener('click', () => {
@@ -1954,8 +2719,7 @@
                 addAndRunTask('retry', { fileList: result.failed });
             });
             
-            retryBtn.addEventListener('mouseenter', () => dropdownMenu.style.display = 'block');
-            dropdown.addEventListener('mouseleave', () => dropdownMenu.style.display = 'none');
+            bindTapDropdown(retryBtn, dropdown, dropdownMenu);
             
             modal.querySelectorAll('.copy-dropdown-item').forEach(item => {
                 item.addEventListener('click', () => {
@@ -2156,6 +2920,218 @@
         }
     }
 
+    // ============ 分享页：选中单个文件 → 「提取该文件直链」 ============
+    const DIRECTLINK_TRIGGER_ID = 'directlink-trigger';
+
+    /** 分享页判定：mshare/share 子域，或路径里带 /123pan/ 或 /s/ */
+    function isSharePage() {
+        const h = String(location.hostname || '');
+        if (/(^|\.)(m?share)\.123pan\.(cn|com)$/.test(h)) return true;
+        return /\/123pan\//.test(location.pathname) || /^\/s\//.test(location.pathname);
+    }
+
+    /** 一行是不是被勾上：桌面版 rowSelected / 移动版 appTableSelected，兜底看复选框 */
+    function isShareRowSelected(row) {
+        const c = String(row.className || '');
+        if (/rowSelected/.test(c) || /appTableSelected/.test(c)) return true;
+        const cb = row.querySelector('input[type="checkbox"]');
+        return !!(cb && cb.checked);
+    }
+
+    /**
+     * 行里的文件名。
+     * 桌面版：.table-file-name / [class*="table-list-file-name"]
+     * 移动版：.file-name-display —— 它有 aria-label，能拿到**未被省略号截断**的全名，
+     *         比 textContent 更可靠（截断过的名字没法拿去和 share/get 的 FileName 精确匹配）。
+     */
+    function shareRowName(row) {
+        const nm = row.querySelector('[class*="table-list-file-name"]')
+            || row.querySelector('.table-file-name')
+            || row.querySelector('.file-name-display')
+            || row.querySelector('.file-name-line');
+        if (!nm) return '';
+        let al = '';
+        try { al = String((nm.getAttribute && nm.getAttribute('aria-label')) || '').trim(); } catch (e) { }
+        return al || String(nm.textContent || '').replace(/\s+/g, ' ').trim();
+    }
+
+    /** 行里是不是文件夹：行内任意 img 的 src 含 folder 即是（两版布局通用） */
+    function shareRowIsFolder(row) {
+        const imgs = row.querySelectorAll('img');
+        for (let i = 0; i < imgs.length; i++) {
+            if (/folder/i.test(String(imgs[i].getAttribute('src') || ''))) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 分享页当前**被勾选**的行 -> [{ name, isFolder }]。
+     * 站点有两套布局，同一份脚本都要认：
+     *   桌面版  <table> 行 = tr.custom-table-row
+     *   移动版  div 列表 行 = .appTable     <- M浏览器 / 手机浏览器实测走的是这套
+     * 表头/全选那一行的复选框不在行容器里，天然被排除。
+     */
+    function getShareSelection() {
+        let rows = Array.prototype.slice.call(document.querySelectorAll('tr.custom-table-row'));
+        if (!rows.length) rows = Array.prototype.slice.call(document.querySelectorAll('.appTable'));
+        const out = [];
+        for (let i = 0; i < rows.length; i++) {
+            const row = rows[i];
+            if (!isShareRowSelected(row)) continue;
+            const name = shareRowName(row);
+            if (!name) continue;
+            out.push({ name: name, isFolder: shareRowIsFolder(row) });
+        }
+        return out;
+    }
+
+    /**
+     * 分享页的 SPA 进子目录**不改 URL**，拿不到当前目录 id（行节点上也没有 data-* 带 FileId）。
+     * 做法：从根目录开始按文件名逐级往下找，命中即返回条目与它所属目录 id。
+     * 有界：最多 40 次请求、5 层，避免在超大分享里失控。
+     */
+    async function findShareFileByName(shareKey, fileName, parentFileId, depth, budget) {
+        const pid = (parentFileId == null ? 0 : parentFileId);
+        budget.n = (budget.n || 0) + 1;
+        if (budget.n > 40 || depth > 5) return null;
+        const listed = await listShareFiles(shareKey, pid);
+        if (Number(listed.code) !== 0) return null;
+        const list = listed.list || [];
+        for (let i = 0; i < list.length; i++) {
+            if (String(list[i].FileName) === fileName && Number(list[i].Type) !== 1) {
+                return { item: list[i], parentId: pid };
+            }
+        }
+        for (let i = 0; i < list.length; i++) {
+            if (Number(list[i].Type) !== 1) continue;
+            const hit = await findShareFileByName(shareKey, fileName, list[i].FileId, depth + 1, budget);
+            if (hit) return hit;
+        }
+        return null;
+    }
+
+    /** 点按钮：把「选中行」翻成「该文件的直链」，复用 extractDirectLink 的整条链路 */
+    async function extractSelectedFileLink() {
+        const shareKey = currentShareKey();
+        if (!shareKey || !isSharePage()) return extractDirectLink({});
+        const sel = getShareSelection();
+        if (sel.length !== 1) {
+            showFastLinkToast('请在分享页里只选中一个文件（当前选中 ' + sel.length + ' 项）', 'warning', 4000);
+            return { ok: false, code: -1, reason: '未恰好选中 1 项' };
+        }
+        const item = sel[0];
+        if (item.isFolder) {
+            showFastLinkToast('选中的是文件夹；直链只能按具体文件提取', 'warning', 4000);
+            return { ok: false, code: -1, reason: '选中的是文件夹' };
+        }
+        showFastLinkToast('正在定位「' + item.name + '」…', 'info', 2500);
+        const hit = await findShareFileByName(shareKey, item.name, 0, 0, { n: 0 });
+        if (!hit) {
+            const reason = '逐级查找没定位到「' + item.name + '」'
+                + '（分享可能很大，或列目录被服务端限流）；请进入该文件所在目录后重试';
+            pan123State.lastResult = { ok: false, code: -1, reason: reason, loggedIn: null };
+            showFastLinkToast('提取失败：' + reason, 'error', 6000);
+            return { ok: false, code: -1, reason: reason };
+        }
+        pan123State.shareKey = shareKey;
+        return extractDirectLink({ parentFileId: hit.parentId, onlyName: item.name });
+    }
+
+    /** 分享页浮动按钮：只在「恰好选中 1 个文件」时出现 */
+    /** 「提取该文件直链」点击处理：行内按钮与浮动圆钮共用同一套逻辑 */
+    function onDirectLinkClick(e) {
+        if (e && e.preventDefault) e.preventDefault();
+        if (e && e.stopPropagation) e.stopPropagation();
+        let dlOn = true;
+        try { dlOn = (typeof user === 'undefined') ? true : (user.directLink === 1); } catch (err) { dlOn = true; }
+        if (!dlOn) {
+            showFastLinkToast('直链提取已在设置中关闭', 'warning', 3000);
+            return;
+        }
+        extractSelectedFileLink().catch(function (err) {
+            showFastLinkToast('提取失败：' + err, 'error', 5000);
+        });
+    }
+
+    /**
+     * 「提取该文件直链」按钮：只在「恰好选中 1 个文件」时出现。
+     * 桌面版放进表头 .rightInfo 的下载按钮那一组（和站点自己的
+     * 「浏览器下载 / 客户端下载」排在一起）；移动版没有这条表头，
+     * 退回右下角浮动圆钮。
+     */
+    function updateDirectLinkTrigger() {
+        if (!isSharePage() || !document.body) return;
+        const sel = getShareSelection();
+        const show = (sel.length === 1 && !sel[0].isFolder);
+        const floatBtn = document.getElementById(DIRECTLINK_TRIGGER_ID);
+        const inlineBtn = document.getElementById('directlink-inline');
+        const wrap = headerRow();
+        const right = wrap ? wrap.querySelector('.rightInfo') : null;
+
+        if (!show) {
+            if (floatBtn) floatBtn.remove();
+            if (inlineBtn) inlineBtn.remove();
+            return;
+        }
+
+        if (right) {
+            // 桌面版：行内按钮，插到「浏览器下载 / 客户端下载」那一组之后
+            if (floatBtn) floatBtn.remove();
+            let btn = inlineBtn;
+            if (!btn) {
+                btn = document.createElement('button');
+                btn.id = 'directlink-inline';
+                btn.type = 'button';
+                btn.className = 'pan123-inline-btn primary';
+                btn.addEventListener('click', onDirectLinkClick);
+            }
+            btn.title = '提取「' + sel[0].name + '」的直链';
+            btn.setAttribute('aria-label', btn.title);
+            btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"></path><path d="M7 10l5 5 5-5"></path><path d="M4 19h16"></path></svg><span>提取直链</span>';
+            if (!right.contains(btn)) {
+                const anchors = right.querySelectorAll('.client-download-btn');
+                const last = anchors[anchors.length - 1];
+                const after = last ? (last.closest('.mfy_h-tooltip-module__trigger__9Pxct') || last) : null;
+                if (after && after.parentNode === right && after.nextSibling) {
+                    right.insertBefore(btn, after.nextSibling);
+                } else {
+                    right.appendChild(btn);
+                }
+            }
+            return;
+        }
+
+        // 移动版：右下浮动圆钮
+        if (inlineBtn) inlineBtn.remove();
+        if (floatBtn && document.body.contains(floatBtn)) return;
+        const el = document.createElement('button');
+        el.id = DIRECTLINK_TRIGGER_ID;
+        el.title = '提取「' + sel[0].name + '」的直链';
+        el.setAttribute('aria-label', el.title);
+        el.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"></path><path d="M7 10l5 5 5-5"></path><path d="M4 19h16"></path></svg>';
+        el.addEventListener('click', onDirectLinkClick);
+        document.body.appendChild(el);
+    }
+
+    /** 选中态是 React 重渲染出来的、不冒泡 click；用 MutationObserver + 捕获期 click + 轮询三重兜底 */
+    function addDirectLinkTrigger() {
+        if (!isSharePage()) return;
+        const tick = function () { try { updateDirectLinkTrigger(); } catch (e) { } };
+        tick();
+        let pending = false;
+        const schedule = function () {
+            if (pending) return;
+            pending = true;
+            setTimeout(function () { pending = false; tick(); }, 120);
+        };
+        try {
+            const mo = new MutationObserver(schedule);
+            mo.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'checked'] });
+        } catch (e) { }
+        document.addEventListener('click', schedule, true);
+        setInterval(tick, 2000);
+    }
+
     function addFastLinkButton() {
         if (!FastLinkConfig.enabled) {
             return;
@@ -2250,7 +3226,39 @@
         }
     }
 
+    /** 分享页桌面版的表头操作栏：左 .leftInfo（头像/打赏）右 .rightInfo（下载类按钮） */
+    function headerRow() {
+        return document.querySelector('.content-header-container-wrap');
+    }
+
+    /**
+     * 桌面版：把「设置」放进头像那一行（.leftInfo，与上游的位置一致）。
+     * 放得下就返回 true，调用方不再创建右下浮动圆钮。
+     * 移动版没有这条表头，返回 false -> 仍旧用浮动圆钮。
+     */
+    function mountInlineSettings() {
+        const wrap = headerRow();
+        if (!wrap) return false;
+        const left = wrap.querySelector('.leftInfo');
+        if (!left) return false;
+        let btn = document.getElementById('settings-inline');
+        if (!btn) {
+            btn = document.createElement('button');
+            btn.id = 'settings-inline';
+            btn.className = 'pan123-inline-btn';
+            btn.type = 'button';
+            btn.title = '123云盘脚本设置';
+            btn.innerHTML = '<span>设置</span>';
+            btn.addEventListener('click', createSettingsPanel);
+        }
+        if (!left.contains(btn)) left.appendChild(btn);
+        const float = document.getElementById('settings-trigger');
+        if (float) float.remove();
+        return true;
+    }
+
     function addTriggerButton() {
+        if (mountInlineSettings()) return;
         const trigger = document.createElement('button');
         trigger.id = 'settings-trigger';
         trigger.innerHTML = `
@@ -2553,6 +3561,39 @@
                 background: linear-gradient(135deg, rgba(26, 115, 232, 1), rgba(21, 87, 176, 1)) !important;
             }
             
+            /* 表头操作栏里的行内按钮（桌面版；移动版仍用右下浮动圆钮） */
+            .pan123-inline-btn {
+                display: inline-flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                gap: 6px !important;
+                height: 32px !important;
+                padding: 0 12px !important;
+                margin-left: 8px !important;
+                font-size: 14px !important;
+                font-family: inherit !important;
+                color: #1a73e8 !important;
+                background: rgba(26, 115, 232, 0.08) !important;
+                border: 1px solid rgba(26, 115, 232, 0.35) !important;
+                border-radius: 6px !important;
+                cursor: pointer !important;
+                white-space: nowrap !important;
+                vertical-align: middle !important;
+                transition: background 0.2s ease, color 0.2s ease !important;
+            }
+            .pan123-inline-btn:hover {
+                background: rgba(26, 115, 232, 0.16) !important;
+            }
+            .pan123-inline-btn.primary {
+                color: #fff !important;
+                background: #1a73e8 !important;
+                border-color: #1a73e8 !important;
+            }
+            .pan123-inline-btn.primary:hover {
+                background: #1557b0 !important;
+            }
+            .pan123-inline-btn svg { flex: 0 0 auto !important; }
+
             /* 触发按钮 */
             #settings-trigger {
                 position: fixed !important;
@@ -2581,6 +3622,37 @@
                 box-shadow: 0 8px 25px rgba(26, 115, 232, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.2) inset !important;
             }
             
+                /* 分享页：选中单个文件时的「提取该文件直链」按钮。
+                   ⚡ 只在主站出现、本按钮只在分享页出现，因此共用同一竖列位置。
+                   注意：基础样式必须写在下面的 @media 之前，否则窄屏媒体查询会被它盖掉，
+                   导致这枚按钮在手机上比其他两枚大一圈（实测 Via 上就是 54px vs 44px）。 */
+                #directlink-trigger {
+                    position: fixed !important;
+                    bottom: 90px !important;
+                    right: 20px !important;
+                    width: 54px !important;
+                    height: 54px !important;
+                    background: rgba(0, 137, 123, 0.92) !important;
+                    backdrop-filter: blur(15px) !important;
+                    -webkit-backdrop-filter: blur(15px) !important;
+                    color: white !important;
+                    border: 1px solid rgba(255, 255, 255, 0.25) !important;
+                    border-radius: 50% !important;
+                    cursor: pointer !important;
+                    z-index: 9999 !important;
+                    box-shadow: 0 6px 20px rgba(0, 137, 123, 0.35), 0 0 0 1px rgba(255, 255, 255, 0.1) inset !important;
+                    display: flex !important;
+                    align-items: center !important;
+                    justify-content: center !important;
+                    transition: transform 0.25s ease, background 0.25s ease, box-shadow 0.25s ease !important;
+                }
+                #directlink-trigger:hover,
+                #directlink-trigger:active {
+                    background: rgba(0, 121, 108, 0.98) !important;
+                    transform: scale(1.06) !important;
+                    box-shadow: 0 10px 26px rgba(0, 137, 123, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.2) inset !important;
+                }
+
                 /* 响应式设计 */
                 @media (max-width: 600px) {
                     .settings-panel {
@@ -2629,6 +3701,20 @@
                     
                     #settings-trigger {
                         bottom: 16px !important;
+                        right: 16px !important;
+                        width: 44px !important;
+                        height: 44px !important;
+                    }
+                    
+                    #fastlink-trigger {
+                        bottom: 70px !important;
+                        right: 16px !important;
+                        width: 44px !important;
+                        height: 44px !important;
+                    }
+
+                    #directlink-trigger {
+                        bottom: 70px !important;
                         right: 16px !important;
                         width: 44px !important;
                         height: 44px !important;
@@ -2962,13 +4048,46 @@
     }
 
     // 注册菜单命令
+    // 注册菜单命令
     GM_registerMenuCommand('⚙️ 打开设置面板', createSettingsPanel);
+    GM_registerMenuCommand('⬇️ 提取当前分享直链', function () {
+        if (user.directLink !== 1) {
+            showFastLinkToast('直链提取已在设置中关闭', 'warning', 3000);
+            return;
+        }
+        extractDirectLink({}).catch(function (e) { showFastLinkToast('提取失败：' + e, 'error', 5000); });
+    });
+    GM_registerMenuCommand('🔎 下载状态诊断（登录态/流量闸门/直链）', function () {
+        diagnoseDownload().catch(function (e) { showFastLinkToast('诊断失败：' + e, 'error', 5000); });
+    });
+    GM_registerMenuCommand('🔑 打开登录入口（登录后每月 10GB 免费提取）', function () {
+        openLoginEntry();
+    });
+
+    // 调试/自测入口（供控制台与自动化验收调用）
+    try {
+        unsafeWindow.__pan123Fix = {
+            version: '1.2.8',
+            state: pan123State,
+            currentShareKey: currentShareKey,
+            buildDownloadUrlFromResponse: buildDownloadUrlFromResponse,
+            normalizeDownloadUrl: normalizeDownloadUrl,
+            extractDirectLink: extractDirectLink,
+            diagnoseDownload: diagnoseDownload,
+            detectLoginState: detectLoginState,
+            fetchTrafficCheck: fetchTrafficCheck,
+            listShareFiles: listShareFiles,
+            openLoginEntry: openLoginEntry,
+            rules: rules
+        };
+    } catch (e) { }
 
     // 等待页面加载完成
     function waitForBody() {
         if (document.body) {
             addStyles(); // 先添加样式
-            addTriggerButton(); // 添加设置按钮
+            addTriggerButton(); // 添加设置按钮（桌面版放进头像那一行）
+            addDirectLinkTrigger(); // 分享页：选中单个文件时出现「提取该文件直链」
             
             // 初始化秒传功能
             if (FastLinkConfig.enabled) {
