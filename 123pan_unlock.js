@@ -37,12 +37,17 @@
 //       服务端便按 web 侧应答、分享方的提取流量包闸门生效。gmRequest 补头后放行。
 //       另修：5113/5114 文案改用服务端原文；不再把文件夹当文件送去提取；
 //       目录里只有文件夹时自动下钻找第一个真文件；未登录提示不再误报给已登录用户。
+//   15. （v1.2.8）修「提取码不正确（当前读到 9999）」：提取码兜底读取原本会扫全页任意
+//       input 的 value，连别的浏览器扩展的隐藏字段（实测 #nopic-pf-maxW = 9999，
+//       图片最大宽高）都当成了提取码。现在只认**看得见**且**确实像提取码**的输入框
+//       （type=password，或 placeholder/aria-label/id/class 含提取码/密码/pwd），
+//       并排除本脚本自己的设置面板。
 //  已知服务端限制（2026-10 实测）：未登录访客提取分享文件必被服务端 5112「您需要注册登录或付费后下载」拒绝，
 //  官方免费通道只有登录（免费账号每月 10GB 提取流量）；看广告解锁通道对访客返回 adId:0（无广告），不可用。
 //  本脚本不绕过服务端闸门，也不伪造成交。
 // @name         123云盘解锁 修复版
 // @author       QingJ
-// @namespace    https://github.com/hawchou1995/123pan_unlock
+// @namespace    https://github.com/QingJ01/123pan_unlock-fix
 // @upstream     https://greasyfork.org/zh-CN/scripts/563328
 // @forked-from  https://github.com/QingJ01/123pan_unlock v1.2.0 (Apache-2.0)
 // @homepageURL  https://github.com/hawchou1995/123pan_unlock
@@ -1228,9 +1233,19 @@
                 if (v) { const t = clean(v); if (t) return t; }
             } catch (e) { }
         }
+        // 兜底：只认「看得见的、确实像提取码」的输入框。
+        // 曾经扫全页任意 input 的 value，结果把别的浏览器扩展的隐藏字段
+        // （实测 #nopic-pf-maxW = 9999，图片最大宽高）当成提取码，
+        // 于是回吐「提取码不正确（当前读到 9999）」，把人指去改一个根本没输错的码。
         try {
+            const PWD_FIELD_HINT = /提取码|提取密码|访问码|访问密码|密码|pwd|password|passcode/i;
             const nodes = document.querySelectorAll('input');
             for (const el of nodes) {
+                if (!el.offsetWidth && !el.offsetHeight) continue;   // 隐藏字段一律不算
+                if (el.closest('#vip-settings-panel, .settings-panel')) continue; // 别读自己的面板
+                const type = String(el.type || '').toLowerCase();
+                const hint = [el.placeholder, el.getAttribute('aria-label'), el.id, el.name, String(el.className || '')].join(' ');
+                if (type !== 'password' && !PWD_FIELD_HINT.test(hint)) continue;
                 const v = (el.value || '').trim();
                 if (looksLikePwd(v)) return v;
             }
