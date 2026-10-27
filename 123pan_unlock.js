@@ -52,7 +52,7 @@
 // @forked-from  https://github.com/QingJ01/123pan_unlock v1.2.0 (Apache-2.0)
 // @homepageURL  https://github.com/hawchou1995/123pan_unlock
 // @supportURL   https://qingju.me
-// @version      1.2.8
+// @version      1.2.13
 // @description  123云盘增强脚本（2026 接口修复版）：规则表迁移到 /v2/share/download/info、/v2/file/batch_download_share_info、/share/download/traffic/check、/share/download-list、/share/get；支持新版 dispatchList+downloadPath 直链响应；直链提取改用 2026 真实载荷（share/get 必填七参数、batch 的 fileIdList:[{FileID,...}]）、拿到直链一键下载不转存；新增下载状态诊断（登录态+流量闸门原文）与登录入口；服务端 5112/5113/5114 原文翻译成人话。原版：解锁会员显示、去广告、秒传链接。
 // @contributor  Baoqing、Chaofan、lipkiat - 123FastLink秒传功能核心贡献者
 // @contributor  hmjz100 - 借鉴了部分适配代码
@@ -1339,6 +1339,7 @@
                 }
                 return;
             }
+
             try {
                 GM_xmlhttpRequest({
                     method: method,
@@ -1367,7 +1368,7 @@
 
     /** 服务端状态快照（供控制台诊断与自动化验收读取，不参与任何伪造） */
     const pan123State = {
-        version: '1.2.8',
+        version: '1.2.13',
         shareKey: '',
         loggedIn: null,        // true/false/null(未知)
         visitor: null,         // GET /api/share/visitor/info 原文
@@ -1378,6 +1379,308 @@
         lastResult: null,
         updatedAt: 0
     };
+
+    // ============ 1.2.11：识别“正在浏览的分享目录” ============
+    // 观察站点自己的 share/get（resource timing + fetch/XHR 钩子）。**按请求来源区分**：
+    //   我们自己的列表请求固定带 `_pan123own=1`（真实接口实测被忽略：code 0、Len/InfoList 不变）；
+    //   不再用全局 in-flight 计数 —— 站点在我们请求未完成时发出的并发导航照常会被记录。
+    // 目录身份优先用 FileId（分享页行节点的 React fiber record.FileId，实测存在），名称只做兜底；
+    // 覆盖不唯一 / 有歧义 -> ''（上层 fail closed）。
+    // 根目录 0 始终是候选：真实根页站点走 `GET /gsb/s/share-list?...shareKey`（不带 ParentFileId），
+    // 我们用它等价的 `/api/share/get?ParentFileId=0` 列表与可见行比对来确认“根页”，而不是猜 id。
+    const PAN123_BROWSE_TTL = 10 * 60 * 1000;
+    const pan123Nav = {
+        shareKey: '',
+        dirs: {},          // 'shareKey|ParentFileId' -> { items: [{id,name}], names: [], ts }
+        seen: {},          // 'shareKey|ParentFileId' -> { ts }（站点请求 URL）
+        lastParentId: null,
+        lastTs: 0,
+        rootListTs: 0      // 站点最后一次 /gsb/s/share-list（无 ParentFileId）的时间，仅诊断
+    };
+
+    function pan123Param(url, name) {
+        try {
+            const q = String(url || '').split('?')[1] || '';
+            if (!q) return '';
+            const parts = q.split('&');
+            const lower = String(name).toLowerCase();
+            for (let i = 0; i < parts.length; i++) {
+                const kv = parts[i].split('=');
+                if (String(kv[0] || '').toLowerCase() === lower) return decodeURIComponent(kv[1] || '');
+            }
+        } catch (e) { }
+        return '';
+    }
+
+    function pan123IsShareGet(url) {
+        return /\/api\/share\/get(?:[?#]|$)/.test(String(url || ''));
+    }
+
+    /** 自己的请求：URL 带 _pan123own=1。比“全局计数”精确，也不会误伤同 URL 的站点请求。 */
+    function pan123IsOwnUrl(url) {
+        return pan123Param(url, '_pan123own') === '1';
+    }
+
+    function pan123NoteDirRequest(url) {
+        try {
+            const s = String(url || '');
+            if (/\/gsb\/s\/share-list(?:[?#]|$)/.test(s) && pan123Param(s, 'ParentFileId') === '') {
+                const sk0 = pan123Param(s, 'shareKey') || pan123Param(s, 'ShareKey');
+                if (sk0) { pan123Nav.shareKey = sk0; pan123Nav.rootListTs = Date.now(); }
+            }
+            if (!pan123IsShareGet(s)) return;
+            if (pan123IsOwnUrl(s)) return;
+            const pid = pan123Param(s, 'ParentFileId');
+            const sk = pan123Param(s, 'shareKey') || pan123Param(s, 'ShareKey');
+            if (pid === '' || !sk) return;
+            pan123Nav.shareKey = sk;
+            pan123Nav.seen[sk + '|' + String(pid)] = { ts: Date.now() };
+            pan123Nav.lastParentId = String(pid);
+            pan123Nav.lastTs = Date.now();
+        } catch (e) { }
+    }
+
+    function pan123NoteDirResponse(url, json) {
+        try {
+            if (pan123IsOwnUrl(url)) return;
+            const pid = pan123Param(url, 'ParentFileId');
+            const sk = pan123Param(url, 'shareKey') || pan123Param(url, 'ShareKey');
+            if (pid === '' || !sk) return;
+            const d = (json && json.data) || {};
+            const list = d.InfoList || [];
+            const items = [];
+            const names = [];
+            for (let i = 0; i < list.length; i++) {
+                names.push(String(list[i].FileName || ''));
+                items.push({ id: (list[i].FileId == null ? '' : String(list[i].FileId)), name: String(list[i].FileName || '') });
+            }
+            pan123Nav.dirs[sk + '|' + pid] = { items: items, names: names, ts: Date.now() };
+        } catch (e) { }
+    }
+
+    /** 只观察站点自己的请求；自己的请求靠 URL 标记排除（见 pan123IsOwnUrl） */
+    function pan123InstallNavObserver() {
+        if (window.__pan123NavHooked) return;
+        window.__pan123NavHooked = true;
+
+        // ① resource timing：站点把 fetch/XHR 都换掉也能看到“页面自己请求了哪个目录”
+        try {
+            if (window.PerformanceObserver) {
+                const po = new PerformanceObserver(function (list) {
+                    const es = list.getEntries();
+                    for (let i = 0; i < es.length; i++) {
+                        const u = es[i].name;
+                        if (!pan123IsShareGet(u) && !/\/gsb\/s\/share-list(?:[?#]|$)/.test(u)) continue;
+                        pan123NoteDirRequest(u);
+                    }
+                });
+                po.observe({ type: 'resource', buffered: true });
+                try { window.__pan123Po = po; } catch (e) { }
+            }
+        } catch (e) { }
+
+        // ② fetch 钩子：能拿到响应体时直接记录目录内文件名/FileId
+        try {
+            const wrapFetch = function (orig) {
+                if (typeof orig !== 'function') return orig;
+                if (orig.__pan123Wrapped) return orig;
+                const w = function (input, init) {
+                    let url = '';
+                    try { url = (typeof input === 'string') ? input : ((input && input.url) || ''); } catch (e) { }
+                    if (!pan123IsOwnUrl(url)) pan123NoteDirRequest(url);
+                    const p = orig.apply(this, arguments);
+                    if (!pan123IsOwnUrl(url) && pan123IsShareGet(url) && p && typeof p.then === 'function') {
+                        try {
+                            p.then(function (resp) {
+                                try {
+                                    resp.clone().json().then(function (j) { pan123NoteDirResponse(url, j); }).catch(function () { });
+                                } catch (e) { }
+                            }).catch(function () { });
+                        } catch (e) { }
+                    }
+                    return p;
+                };
+                w.__pan123Wrapped = true;
+                return w;
+            };
+            let __realFetch = window.fetch;
+            let __wrappedFetch = wrapFetch(__realFetch);
+            Object.defineProperty(window, 'fetch', {
+                configurable: true,
+                get: function () { return __wrappedFetch; },
+                set: function (f) { __realFetch = f; __wrappedFetch = wrapFetch(f); }
+            });
+        } catch (e) { }
+
+        // ③ XHR 钩子：同上
+        try {
+            const XP = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+            if (XP && XP.open && XP.send) {
+                let __realOpen = XP.open;
+                const __openWrap = function (method, url) {
+                    try { this.__pan123Url = url; } catch (e) { }
+                    return __realOpen.apply(this, arguments);
+                };
+                Object.defineProperty(XP, 'open', {
+                    configurable: true,
+                    get: function () { return __openWrap; },
+                    set: function (f) { __realOpen = f; }
+                });
+                let __realSend = XP.send;
+                const __sendWrap = function () {
+                    try {
+                        const url = this.__pan123Url || '';
+                        if (!pan123IsOwnUrl(url) && pan123IsShareGet(url)) {
+                            pan123NoteDirRequest(url);
+                            this.addEventListener('load', function () {
+                                try { pan123NoteDirResponse(url, JSON.parse(this.responseText)); } catch (e) { }
+                            });
+                        }
+                    } catch (e) { }
+                    return __realSend.apply(this, arguments);
+                };
+                Object.defineProperty(XP, 'send', {
+                    configurable: true,
+                    get: function () { return __sendWrap; },
+                    set: function (f) { __realSend = f; }
+                });
+            }
+        } catch (e) { }
+    }
+
+    function pan123VisibleRows() {
+        const out = [];
+        let rows = Array.prototype.slice.call(document.querySelectorAll('tr.custom-table-row'));
+        if (!rows.length) rows = Array.prototype.slice.call(document.querySelectorAll('.appTable'));
+        for (let i = 0; i < rows.length; i++) {
+            const n = shareRowName(rows[i]);
+            if (!n) continue;
+            out.push({ name: n, fileId: pan123RowFileId(rows[i]) });
+        }
+        return out;
+    }
+
+    function pan123SameNames(a, b) {
+        if (!a || !b || a.length !== b.length) return false;
+        const x = a.slice().sort();
+        const y = b.slice().sort();
+        for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+        return true;
+    }
+
+    /**
+     * 可见行是否被某目录覆盖 + 是否“完全相等”（1.2.12）。
+     * 强约束：可见行只要带可信 FileId，该 ID **必须**出现在候选列表里；
+     * 候选只是“同名但 ID 不同”时绝不回退成 cover（v1.2.11 的缺陷就出在这里）。
+     * 混合行（部分有 ID、部分没有）：有 ID 的行按 ID 命中，没有 ID 的行才用名称。
+     * 一行 ID 都没有时才整体按名称（此时没有更强证据）；歧义由调用方 fail closed。
+     */
+    function pan123CoverInfo(visible, items) {
+        if (!visible.length || !items || !items.length) return { cover: false, exact: false, idBased: false };
+        const ids = {};
+        const names = {};
+        for (let i = 0; i < items.length; i++) {
+            if (items[i].id) ids[String(items[i].id)] = 1;
+            names[String(items[i].name)] = 1;
+        }
+        let known = 0;
+        for (let i = 0; i < visible.length; i++) {
+            const v = visible[i];
+            if (v.fileId) {
+                known++;
+                if (!ids[String(v.fileId)]) return { cover: false, exact: false, idBased: false };
+            } else if (!names[String(v.name)]) {
+                return { cover: false, exact: false, idBased: false };
+            }
+        }
+        if (!known) {
+            return {
+                cover: true,
+                exact: pan123SameNames(visible.map(function (v) { return v.name; }), items.map(function (it) { return it.name; })),
+                idBased: false
+            };
+        }
+        return { cover: true, exact: visible.length === items.length, idBased: known === visible.length };
+    }
+
+    /**
+     * 正在浏览的目录 id（async）：
+     *   候选 = 站点自己请求过的 ParentFileId（排除带 _pan123own=1 的自身请求）+ 根目录 0；
+     *   验证 = 我们自己的列表请求读该目录 FileId/名称，必须覆盖可见行；多个候选覆盖 -> 歧义，返回 ''。
+     */
+    async function currentBrowseParentId() {
+        const sk = currentShareKey();
+        if (!sk) return '';
+        const visible = pan123VisibleRows();
+        if (!visible.length) return '';
+        const now = Date.now();
+        const prefix = sk + '|';
+        const cands = [];
+        const seenPid = {};
+        const pushCand = function (pid, ts) {
+            const key = String(pid);
+            if (seenPid[key]) return;
+            seenPid[key] = 1;
+            cands.push({ pid: key, ts: ts || 0 });
+        };
+        for (const k in pan123Nav.seen) {
+            if (k.indexOf(prefix) !== 0) continue;
+            const rec = pan123Nav.seen[k];
+            if (!rec || (now - rec.ts) > PAN123_BROWSE_TTL) continue;
+            pushCand(k.slice(prefix.length), rec.ts);
+        }
+        for (const k in pan123Nav.dirs) {
+            if (k.indexOf(prefix) !== 0) continue;
+            const rec = pan123Nav.dirs[k];
+            if (!rec || (now - rec.ts) > PAN123_BROWSE_TTL) continue;
+            pushCand(k.slice(prefix.length), rec.ts);
+        }
+        cands.sort(function (a, b) { return b.ts - a.ts; });
+        const probe = cands.slice(0, 3);
+        const matched = [];
+        const probeDir = async function (pid) {
+            const key = prefix + pid;
+            let rec = pan123Nav.dirs[key];
+            if (!rec || !rec.items || !rec.items.length) {
+                const listed = await listAllShareFiles(sk, pid, { n: 0, max: 6 });
+                if (listed.failed || listed.truncated) return null;
+                const items = [];
+                const names = [];
+                for (let k = 0; k < listed.list.length; k++) {
+                    names.push(String(listed.list[k].FileName || ''));
+                    items.push({ id: (listed.list[k].FileId == null ? '' : String(listed.list[k].FileId)), name: String(listed.list[k].FileName || '') });
+                }
+                rec = { items: items, names: names, ts: Date.now() };
+                pan123Nav.dirs[key] = rec;
+            }
+            const cov = pan123CoverInfo(visible, rec.items);
+            return cov.cover ? { pid: pid, exact: cov.exact, idBased: cov.idBased } : null;
+        };
+        for (let i = 0; i < probe.length; i++) {
+            const hit = await probeDir(probe[i].pid);
+            if (hit) matched.push(hit);
+        }
+        // FileId 命中优先；没有任何 ID 锚点（或混合行）而多个候选都覆盖可见名称时，
+        // 绝不按“名称集恰好相等/可见子集”去猜目录（虚拟列表只显示 a,b 时，真目录 201(a,b,c)
+        // 与另一个 202(a,b) 会同时匹配）——直接拒绝，交给上层提示。
+        let idHits = matched.filter(function (m) { return m.idBased; });
+        if (idHits.length === 1) return idHits[0].pid;
+        if (idHits.length > 1) return '';
+        // 根目录候选：只有站点确实发过 /gsb/s/share-list（无 ParentFileId）时才探，避免无证据的额外请求
+        if (pan123Nav.rootListTs && (now - pan123Nav.rootListTs) <= PAN123_BROWSE_TTL) {
+            const rootHit = await probeDir('0');
+            if (rootHit && !matched.some(function (m) { return m.pid === '0'; })) matched.push(rootHit);
+        }
+        idHits = matched.filter(function (m) { return m.idBased; });
+        if (idHits.length === 1) return idHits[0].pid;
+        if (idHits.length > 1) return '';
+        if (matched.length === 1) return matched[0].pid;
+        return '';
+    }
+
+    pan123InstallNavObserver();
+
+
 
     /**
      * 登录态判定：GET /api/share/visitor/info，**必须带 Authorization: Bearer**。
@@ -1420,30 +1723,173 @@
         return d;
     }
 
+    const PAN123_PAGE_LIMIT = 100;
+    const PAN123_PAGE_MAX = 20;
+    const PAN123_REQUEST_BUDGET = 40;
+
     /**
      * 列分享文件：GET /api/share/get
      * 必填参数（缺一个服务端就报 请输入X）：ShareKey、ParentFileId、Limit、
      * OrderBy、OrderDirection、Next、Page。2026-10 实测。
+     * 1.2.10：参数与站点自身请求对齐（Next=-1、Page 为 (page-1)*Limit 偏移，实测）；
+     * 并回传服务端真实分页字段 Next/Len/IsFirst（真实 data 里**没有 Total**）。
      */
-    async function listShareFiles(shareKey, parentFileId) {
+    async function listShareFiles(shareKey, parentFileId, page) {
         const __qs = new URLSearchParams({
             ShareKey: shareKey,
             ParentFileId: String(parentFileId == null ? 0 : parentFileId),
-            Limit: '100',
+            Limit: String(PAN123_PAGE_LIMIT),
             OrderBy: 'FileName',
             OrderDirection: 'asc',
-            Next: '0',
-            Page: '1'
+            Next: '-1',
+            Page: String(page == null ? 1 : page)
         });
         // 有提取码才带：无码分享带空值会被服务端当成错码
         const __pwd = getSharePwd(shareKey);
         if (__pwd) __qs.set('SharePwd', __pwd);
+        // 1.2.11：来源标记（真实接口实测被忽略：code 0、Len/InfoList 不变）
+        __qs.set('_pan123own', '1');
         const qs = __qs.toString();
         const r = await gmRequest('GET', location.origin + '/api/share/get?' + qs);
         const d = (r.json && r.json.data) || {};
         const list = d.InfoList || d.FileList || d.infoList || d.fileList || [];
-        return { status: r.status, code: r.json && r.json.code, message: r.json && r.json.message, list: list };
+        return {
+            status: r.status,
+            code: r.json && r.json.code,
+            message: r.json && r.json.message,
+            list: list,
+            len: (d.Len === undefined || d.Len === null) ? null : Number(d.Len),
+            next: (d.Next === undefined || d.Next === null) ? null : String(d.Next),
+            isFirst: (d.IsFirst === undefined || d.IsFirst === null) ? null : !!d.IsFirst,
+            expired: !!d.Expired
+        };
     }
+
+    /**
+     * 把当前目录的所有页拉全（1.2.10），只用真实存在的分页信号：
+     *   - Len=0 或本页 0 条 -> 结束（末页之后服务端返回 Len=0/Next=""）；
+     *   - Next="-1" -> 末页；Next="" -> 还有下一页；
+     *   - 本页全是已见过的 FileId（服务端忽略 Page / 重复页）-> truncated；
+     *   - 响应没有 Next（形状未知）-> truncated（不能证明取全，fail closed）；
+     *   - Next 是其它未知游标 -> truncated（不猜语义）；
+     *   - 页数/请求预算上限 -> truncated。
+     * 任何一个 truncated 为真，上层都不得声称“最新”。
+     * budget.n 按**真实 HTTP 请求数**计（每页一次）。
+     */
+    async function listAllShareFiles(shareKey, parentFileId, budget) {
+        const b = budget || { n: 0, max: PAN123_REQUEST_BUDGET };
+        const seen = {};
+        const out = [];
+        let complete = false;
+        let truncated = false;
+        let lastNext = null;
+        let lastLen = null;
+        for (let page = 1; page <= PAN123_PAGE_MAX; page++) {
+            if (b.n >= (b.max || PAN123_REQUEST_BUDGET)) { truncated = true; break; }
+            b.n++;
+            const r = await listShareFiles(shareKey, parentFileId, page);
+            if (Number(r.code) !== 0) {
+                return {
+                    code: r.code, message: r.message, status: r.status,
+                    list: out, complete: false, truncated: out.length > 0,
+                    failed: true, requests: b.n
+                };
+            }
+            const list = r.list || [];
+            const len = (r.len == null || isNaN(r.len)) ? list.length : r.len;
+            lastNext = r.next;
+            lastLen = len;
+            let added = 0;
+            for (let i = 0; i < list.length; i++) {
+                const k = String(list[i].FileId);
+                if (seen[k]) continue;
+                seen[k] = 1;
+                out.push(list[i]);
+                added++;
+            }
+            if (len === 0 || !list.length) { complete = true; break; }
+            if (!added) { truncated = true; break; }
+            if (r.next === null) { truncated = true; break; }
+            if (r.next === '-1') { complete = true; break; }
+            if (r.next !== '') { truncated = true; break; }
+        }
+        if (!complete && !truncated) truncated = true;
+        return {
+            code: 0, message: 'ok', list: out, complete: complete, truncated: truncated,
+            failed: false, next: lastNext, len: lastLen, requests: b.n
+        };
+    }
+
+    /**
+     * 分享文件的时间字段（1.2.10）。
+     * 实测真实 /api/share/get 的 UpdateAt/CreateAt 是 ISO 带时区字符串（如 2025-04-06T19:29:36+08:00）；
+     * 这里同时接受纯数字字符串的 epoch（秒/毫秒），并把 0 / 负数 / 非法值一律判为**无效**（不是 1970）。
+     * 返回 { t, key } 或 null（null 表示这条记录没有可核实时间）。
+     */
+    function shareFileTime(item) {
+        const keys = ['UpdateAt', 'CreateAt'];
+        for (let i = 0; i < keys.length; i++) {
+            const v = item && item[keys[i]];
+            if (v == null) continue;
+            let t = NaN;
+            if (typeof v === 'number') {
+                if (!isFinite(v) || v <= 0) continue;
+                t = v < 1e12 ? v * 1000 : v;
+            } else {
+                const s = String(v).trim();
+                if (!s) continue;
+                if (/^-?\d+$/.test(s)) {
+                    const n = Number(s);
+                    if (!isFinite(n) || n <= 0) continue;
+                    t = n < 1e12 ? n * 1000 : n;
+                } else {
+                    t = Date.parse(s);
+                    if (isNaN(t)) t = Date.parse(s.replace(' ', 'T'));
+                }
+            }
+            if (!isFinite(t) || isNaN(t) || t <= 0) continue;
+            return { t: t, key: keys[i] };
+        }
+        return null;
+    }
+
+    /**
+     * 在候选文件里挑“最新”（1.2.10）：
+     *   - 目录没拉全（truncated）-> 不猜；
+     *   - **任何**一个候选缺时间/0/无效 -> 不猜（不能把另一个有时间的旧文件说成最新）；
+     *   - 最大时间并列 -> 不猜；
+     *   - 没有候选 -> 交给上层报“未取到可下载文件”。
+     * 返回 { item, key } 或 { reason }。
+     */
+    function pickNewestShareFile(files, truncated) {
+        if (truncated) {
+            return { reason: '目录没有取全（服务端分页异常/忽略 Page/超过枚举上限），无法确认哪个是最新；请选中文件后重试' };
+        }
+        const list = files || [];
+        if (!list.length) return { reason: '' };
+        const missing = [];
+        let best = null;
+        let tied = [];
+        for (let i = 0; i < list.length; i++) {
+            const info = shareFileTime(list[i]);
+            if (!info) { missing.push(list[i] && list[i].FileName); continue; }
+            if (!best || info.t > best.t) {
+                best = info;
+                tied = [list[i]];
+            } else if (info.t === best.t) {
+                tied.push(list[i]);
+            }
+        }
+        if (missing.length) {
+            return { reason: '有 ' + missing.length + ' 个文件没有可核实的时间字段（缺失/0/无效），无法确认哪个最新；请选中文件后重试' };
+        }
+        if (!best) return { reason: '' };
+        if (tied.length > 1) {
+            return { reason: '最新时间相同的文件有 ' + tied.length + ' 个，无法确定唯一目标；请选中文件后重试' };
+        }
+        return { item: tied[0], key: best.key };
+    }
+
 
     /** 打开页面自带的登录入口（登录后即可走免费账号每月 10GB 提取流量） */
     /** 站点登录入口（www.123pan.com/login 会 302 到 yun.123pan.cn/login，2026-10 实测） */
@@ -1480,36 +1926,23 @@
     }
 
     /**
-     * 提取当前分享文件的直链（2026 真实载荷）。
-     * 流程：GET /api/share/visitor/info 判登录态
-     *   -> GET /api/share/get 列文件（含 Etag，未登录时服务端可能不给）
-     *   -> POST /api/share/download/traffic/check 取闸门原始状态（只读展示，不改写）
-     *   -> POST /api/v2/file/batch_download_share_info（载荷 fileIdList:[{FileID,S3keyFlag,Size,Etag,OrderId}]）
-     *   -> 失败且有 Etag 时退回 POST /api/v2/share/download/info
-     * 拿到直链即复制剪贴板并拉起浏览器下载（不经转存、不写盘）。
-     */
-    /**
-     * 从某个目录起找第一个「真文件」（跳过文件夹），有界下钻。
-     * 分享的根目录经常只有一个文件夹（实测样本「新概念3李延隆版」），
-     * 旧逻辑按 Size>0 过滤会把文件夹当文件送去 batch —— 文件夹没有 Etag，
-     * 服务端直接拒（实测 400「已拦截」/ 5113）。
+     * 从某个目录起找“唯一的叶子文件列表”，有界下钻（1.2.10）。
+     * 只有“本层没有文件且只有一个文件夹”才下钻（唯一解）；多个文件夹 -> { ambiguous } 交给上层提示。
+     * budget 与调用方共用，按真实 HTTP 请求数计。
+     * 返回 { parentId, list, truncated } 或 { ambiguous } 或 null。
      */
     async function findFirstShareFile(shareKey, parentFileId, depth, budget) {
         const pid = (parentFileId == null ? 0 : parentFileId);
-        budget.n = (budget.n || 0) + 1;
-        if (budget.n > 40 || depth > 5) return null;
-        const listed = await listShareFiles(shareKey, pid);
+        if (depth > 5) return null;
+        const listed = await listAllShareFiles(shareKey, pid, budget);
         if (Number(listed.code) !== 0) return null;
         const list = listed.list || [];
-        for (let i = 0; i < list.length; i++) {
-            if (Number(list[i].Type) !== 1 && Number(list[i].Size) > 0) {
-                return { item: list[i], parentId: pid };
-            }
-        }
-        for (let i = 0; i < list.length; i++) {
-            if (Number(list[i].Type) !== 1) continue;
-            const hit = await findFirstShareFile(shareKey, list[i].FileId, depth + 1, budget);
-            if (hit) return hit;
+        const files = list.filter(f => Number(f.Type) !== 1 && Number(f.Size) > 0);
+        if (files.length) return { parentId: pid, list: files, truncated: !!listed.truncated };
+        const folders = list.filter(f => Number(f.Type) === 1);
+        if (folders.length > 1) return { ambiguous: folders.length };
+        if (folders.length === 1) {
+            return await findFirstShareFile(shareKey, folders[0].FileId, depth + 1, budget);
         }
         return null;
     }
@@ -1518,36 +1951,112 @@
         opts = opts || {};
         const shareKey = opts.shareKey || currentShareKey();
         const origin = location.origin;
-        if (!shareKey) return { ok: false, code: -1, reason: '未识别到分享 shareKey' };
+        if (!shareKey) {
+            const __noKey = '当前页面不是 123 云盘分享页（未识别到分享 shareKey），无法提取直链';
+            pan123State.lastResult = { ok: false, code: -1, reason: __noKey, loggedIn: null };
+            showFastLinkToast(__noKey, 'warning', 7000);
+            try { console.info('[123云盘解锁] ' + __noKey); } catch (e) { }
+            return { ok: false, code: -1, reason: __noKey };
+        }
         pan123State.shareKey = shareKey;
 
         const loggedIn = await detectLoginState();
-        const __parent = (opts.parentFileId == null ? 0 : opts.parentFileId);
-        const listed = await listShareFiles(shareKey, __parent);
-        // 只认真正的文件：文件夹 Type===1，没有 Etag，送去 batch 必被服务端拒
+        const __explicitParent = (opts.parentFileId == null) ? null : String(opts.parentFileId);
+        const __browseParent = (__explicitParent == null) ? await currentBrowseParentId() : __explicitParent;
+        if (__browseParent === '' || __browseParent == null) {
+            const reason = '无法识别当前所在的分享目录（站点没有发出可对应的目录请求，或可见列表与目录响应对不上）；请先点进目标目录，或直接选中文件后重试';
+            pan123State.lastResult = { ok: false, code: -1, reason: reason, loggedIn: loggedIn };
+            showFastLinkToast('提取失败：' + reason, 'warning', 9000);
+            return { ok: false, code: -1, reason: reason, loggedIn: loggedIn };
+        }
+        const __parent = __browseParent;
+        pan123State.browseParentId = __parent;
+        const __budget = { n: 0, max: PAN123_REQUEST_BUDGET };
+        const listed = await listAllShareFiles(shareKey, __parent, __budget);
+        pan123State.listRequests = listed.requests;
+        if (listed.failed) {
+            // 服务端错误（提取码/限流/鉴权）原样回吐，不能伪装成“分页没取全”
+            const reason = (Number(listed.code) === 5103)
+                ? pwdHint(shareKey)
+                : ('列目录失败：' + (listed.message || ('code ' + listed.code)));
+            pan123State.lastResult = { ok: false, code: listed.code, reason: reason, loggedIn: loggedIn };
+            showFastLinkToast('提取失败：' + reason, 'error', 7000);
+            return { ok: false, code: listed.code, reason: reason, loggedIn: loggedIn };
+        }
         let files = (listed.list || []).filter(f => Number(f.Type) !== 1 && Number(f.Size) > 0);
+        let truncated = !!listed.truncated;
+        if (!files.length && !opts.onlyName && opts.rootPolicy === 'prompt' && String(__parent) === '0') {
+            const __rootFolders = (listed.list || []).filter(f => Number(f.Type) === 1);
+            if (__rootFolders.length) {
+                const __rootNames = __rootFolders.slice(0, 3).map(f => '「' + f.FileName + '」').join('、');
+                const __reason = '分享根页显示的是文件夹' + __rootNames + '，不是可提取的文件；请先打开该文件夹，或在其中选中文件后再提取';
+                pan123State.lastResult = { ok: false, code: -1, reason: __reason, loggedIn: loggedIn };
+                showFastLinkToast('提取失败：' + __reason, 'warning', 9000);
+                return { ok: false, code: -1, reason: __reason, loggedIn: loggedIn };
+            }
+        }
         if (!files.length && !opts.onlyName) {
-            const __first = await findFirstShareFile(shareKey, __parent, 0, { n: 0 });
-            if (__first) {
-                files = [__first.item];
+            const __leaf = await findFirstShareFile(shareKey, __parent, 0, __budget);
+            if (__leaf && __leaf.ambiguous) {
+                const reason = '当前目录只有 ' + __leaf.ambiguous + ' 个文件夹，没有可提取的文件；请点进具体目录或选中文件后重试';
+                pan123State.lastResult = { ok: false, code: -1, reason: reason, loggedIn: loggedIn };
+                showFastLinkToast('提取失败：' + reason, 'warning', 7000);
+                return { ok: false, code: -1, reason: reason, loggedIn: loggedIn };
+            }
+            if (__leaf && __leaf.list) {
+                files = __leaf.list;
+                truncated = !!__leaf.truncated;
                 pan123State.autoDrilled = true;
             }
         }
         if (opts.onlyName) {
-            const __hit = (listed.list || []).filter(f => String(f.FileName) === String(opts.onlyName));
+            if (truncated) {
+                const reason = '当前目录没有取全（分页异常/超过枚举上限），无法确认同名文件数量；请重试或刷新页面后重新选中';
+                pan123State.lastResult = { ok: false, code: -1, reason: reason, loggedIn: loggedIn };
+                showFastLinkToast('提取失败：' + reason, 'warning', 9000);
+                return { ok: false, code: -1, reason: reason, loggedIn: loggedIn };
+            }
+            const __named = (listed.list || []).filter(f => String(f.FileName) === String(opts.onlyName));
+            let __hit = __named.filter(f => Number(f.Type) !== 1);
+            if (opts.onlyFileId) {
+                const __byId = __hit.filter(f => String(f.FileId) === String(opts.onlyFileId));
+                if (!__byId.length) {
+                    const __idReason = '当前目录列表里没有选中行的 FileId（列表可能已变化或没取全），请刷新页面后重新选中';
+                    pan123State.lastResult = { ok: false, code: -1, reason: __idReason, loggedIn: loggedIn };
+                    showFastLinkToast('提取失败：' + __idReason, 'warning', 7000);
+                    return { ok: false, code: -1, reason: __idReason, loggedIn: loggedIn };
+                }
+                __hit = __byId;
+            }
+            if (__hit.length > 1) {
+                const reason = '当前目录里有 ' + __hit.length + ' 个同名文件「' + opts.onlyName + '」，无法确定是哪一个；请只保留一个同名文件后重试';
+                pan123State.lastResult = { ok: false, code: -1, reason: reason, loggedIn: loggedIn };
+                showFastLinkToast('提取失败：' + reason, 'warning', 6000);
+                return { ok: false, code: -1, reason: reason, loggedIn: loggedIn };
+            }
             if (!__hit.length) {
-                const reason = '当前文件夹里没有找到选中的文件「' + opts.onlyName + '」'
-                    + (listed.message ? '（' + listed.message + '）' : '');
+                const __folderOnly = __named.length > 0;
+                const reason = __folderOnly
+                    ? '选中的是文件夹；请选中一个具体文件再提取直链'
+                    : ('当前文件夹里没有找到选中的文件「' + opts.onlyName + '」'
+                        + (listed.message && listed.message !== 'ok' ? '（' + listed.message + '）' : ''));
                 pan123State.lastResult = { ok: false, code: listed.code, reason: reason, loggedIn: loggedIn };
                 showFastLinkToast('提取失败：' + reason, 'error', 6000);
                 return { ok: false, code: listed.code, reason: reason, loggedIn: loggedIn };
             }
-            if (Number(__hit[0].Type) === 1) {
-                const reason = '选中的是文件夹；请选中一个具体文件再提取直链';
-                showFastLinkToast(reason, 'warning', 5000);
+            files = [__hit[0]];
+        } else if (files.length) {
+            // 明确按时间字段选“最新”的一个；缺字段/无效/并列/分页不全都提示，绝不退回数组第一个。
+            const __pick = pickNewestShareFile(files, truncated);
+            if (!__pick.item) {
+                const reason = __pick.reason || ('未取到可下载文件（' + (listed.message || listed.status) + '）');
+                pan123State.lastResult = { ok: false, code: -1, reason: reason, loggedIn: loggedIn };
+                showFastLinkToast('提取失败：' + reason, 'warning', 9000);
                 return { ok: false, code: -1, reason: reason, loggedIn: loggedIn };
             }
-            files = __hit;
+            files = [__pick.item];
+            pan123State.pickedBy = __pick.key;
+            pan123State.orderBy = 'UpdateAt/CreateAt desc（客户端比较）';
         }
         pan123State.files = files.map(f => ({
             FileID: f.FileId, FileName: f.FileName, Size: f.Size,
@@ -1565,6 +2074,7 @@
         }
 
         const check = await fetchTrafficCheck(shareKey, files.map(f => f.FileId));
+
         const results = [];
 
         for (const f of files) {
@@ -2317,7 +2827,7 @@
                 showFastLinkToast('直链提取已在设置中关闭', 'warning', 3000);
                 return;
             }
-            extractDirectLink({}).catch(function (e) { showFastLinkToast('提取失败：' + e, 'error', 5000); });
+            extractSelectedFileLink().catch(function (e) { showFastLinkToast('提取失败：' + e, 'error', 5000); });
         });
         panel.appendChild(directLinkButton);
 
@@ -2970,6 +3480,35 @@
         return al || String(nm.textContent || '').replace(/\s+/g, ' ').trim();
     }
 
+    /** 行节点上的 FileId：分享页用 React fiber 的 record.FileId（实测存在），拿不到返回 '' */
+    function pan123RowFileId(row) {
+        try {
+            const keys = Object.keys(row);
+            let node = null;
+            let props = null;
+            for (let i = 0; i < keys.length; i++) {
+                const k = keys[i];
+                if (k.indexOf('__reactFiber$') === 0) { node = row[k]; break; }
+                if (k.indexOf('__reactProps$') === 0) { props = row[k]; }
+            }
+            const readRec = function (p) {
+                const rec = p && p.record;
+                if (!rec || rec.FileId == null || typeof rec.FileId === 'object') return '';
+                const name = shareRowName(row);
+                if (name && rec.FileName && String(rec.FileName) !== String(name)) return '';
+                return String(rec.FileId);
+            };
+            const fromProps = readRec(props);
+            if (fromProps) return fromProps;
+            for (let d = 0; node && d < 8; d++) {
+                const hit = readRec(node.memoizedProps) || readRec(node.pendingProps);
+                if (hit) return hit;
+                node = node.return;
+            }
+        } catch (e) { }
+        return '';
+    }
+
     /** 行里是不是文件夹：行内任意 img 的 src 含 folder 即是（两版布局通用） */
     function shareRowIsFolder(row) {
         const imgs = row.querySelectorAll('img');
@@ -2980,76 +3519,142 @@
     }
 
     /**
-     * 分享页当前**被勾选**的行 -> [{ name, isFolder }]。
-     * 站点有两套布局，同一份脚本都要认：
-     *   桌面版  <table> 行 = tr.custom-table-row
-     *   移动版  div 列表 行 = .appTable     <- M浏览器 / 手机浏览器实测走的是这套
-     * 表头/全选那一行的复选框不在行容器里，天然被排除。
+     * 分享页当前**被勾选**的行。1.2.10 区分两种“0 个可用项”：
+     *   - 完全没选中（items=0, unreadable=0）-> 上层可以走“当前目录最新”；
+     *   - 有行处于选中态但读不到文件名（unreadable>0）-> 上层必须报错，不能降级取最新。
      */
-    function getShareSelection() {
+    function getShareSelectionDetailed() {
         let rows = Array.prototype.slice.call(document.querySelectorAll('tr.custom-table-row'));
         if (!rows.length) rows = Array.prototype.slice.call(document.querySelectorAll('.appTable'));
-        const out = [];
+        const items = [];
+        let unreadable = 0;
         for (let i = 0; i < rows.length; i++) {
             const row = rows[i];
             if (!isShareRowSelected(row)) continue;
             const name = shareRowName(row);
-            if (!name) continue;
-            out.push({ name: name, isFolder: shareRowIsFolder(row) });
+            if (!name) { unreadable++; continue; }
+            items.push({ name: name, isFolder: shareRowIsFolder(row), fileId: pan123RowFileId(row) });
         }
-        return out;
+        return { items: items, unreadable: unreadable };
+    }
+
+    function getShareSelection() {
+        return getShareSelectionDetailed().items;
     }
 
     /**
-     * 分享页的 SPA 进子目录**不改 URL**，拿不到当前目录 id（行节点上也没有 data-* 带 FileId）。
-     * 做法：从根目录开始按文件名逐级往下找，命中即返回条目与它所属目录 id。
-     * 有界：最多 40 次请求、5 层，避免在超大分享里失控。
+     * 在**指定目录**下按文件名找非文件夹条目（1.2.10）。
+     * - 起点由调用方给（当前浏览目录），不再恒从根目录全树扫描；
+     * - budget 按真实 HTTP 请求数计（listAllShareFiles 每页 +1）；
+     * - 深度 >5、预算用尽、目录分页取不全 -> complete=false，调用方必须 fail closed，
+     *   不允许“hits 恰好 1 个就当唯一”。
      */
-    async function findShareFileByName(shareKey, fileName, parentFileId, depth, budget) {
+    async function findShareFileByName(shareKey, fileName, parentFileId, depth, budget, acc) {
+        const state = acc || { hits: [], complete: true, reason: '' };
+        const b = budget || { n: 0, max: PAN123_REQUEST_BUDGET };
         const pid = (parentFileId == null ? 0 : parentFileId);
-        budget.n = (budget.n || 0) + 1;
-        if (budget.n > 40 || depth > 5) return null;
-        const listed = await listShareFiles(shareKey, pid);
-        if (Number(listed.code) !== 0) return null;
+        if (depth > 5) {
+            state.complete = false;
+            state.reason = state.reason || '目录层级超过 5 层';
+            return state;
+        }
+        if (b.n >= (b.max || PAN123_REQUEST_BUDGET)) {
+            state.complete = false;
+            state.reason = state.reason || '列目录请求预算用尽';
+            return state;
+        }
+        const listed = await listAllShareFiles(shareKey, pid, b);
+        if (listed.failed) {
+            state.complete = false;
+            state.reason = state.reason || ('列目录失败（code ' + listed.code + '）');
+            return state;
+        }
+        if (listed.truncated) {
+            state.complete = false;
+            state.reason = state.reason || '目录没有取全（分页异常/超过枚举上限）';
+        }
         const list = listed.list || [];
         for (let i = 0; i < list.length; i++) {
             if (String(list[i].FileName) === fileName && Number(list[i].Type) !== 1) {
-                return { item: list[i], parentId: pid };
+                state.hits.push({ item: list[i], parentId: pid });
             }
         }
+        if (!state.complete) return state;
         for (let i = 0; i < list.length; i++) {
             if (Number(list[i].Type) !== 1) continue;
-            const hit = await findShareFileByName(shareKey, fileName, list[i].FileId, depth + 1, budget);
-            if (hit) return hit;
+            await findShareFileByName(shareKey, fileName, list[i].FileId, depth + 1, b, state);
         }
-        return null;
+        return state;
     }
 
-    /** 点按钮：把「选中行」翻成「该文件的直链」，复用 extractDirectLink 的整条链路 */
+    /** 点按钮/菜单：先看选中态。
+     *  1 个文件 -> 在“当前浏览目录”里精确找同名（唯一才用）；
+     *  0 个选中 -> 只取“当前浏览目录”的最新；
+     *  多选 / 选中文件夹 / 选中但读不到名字 / 目录识别不了 / 扫描不完整 -> 只提示，不猜。 */
     async function extractSelectedFileLink() {
         const shareKey = currentShareKey();
-        if (!shareKey || !isSharePage()) return extractDirectLink({});
-        const sel = getShareSelection();
-        if (sel.length !== 1) {
-            showFastLinkToast('请在分享页里只选中一个文件（当前选中 ' + sel.length + ' 项）', 'warning', 4000);
-            return { ok: false, code: -1, reason: '未恰好选中 1 项' };
+        if (!shareKey || !isSharePage()) {
+            const reason = '当前页面不是 123 云盘分享页（未识别到分享 shareKey），无法提取直链';
+            pan123State.lastResult = { ok: false, code: -1, reason: reason, loggedIn: null };
+            showFastLinkToast(reason, 'warning', 7000);
+            return { ok: false, code: -1, reason: reason };
         }
-        const item = sel[0];
+        const sel = getShareSelectionDetailed();
+        if (sel.unreadable > 0) {
+            const reason = '有 ' + sel.unreadable + ' 行处于选中态但读不到文件名，无法确定目标；请刷新页面后重新选中';
+            pan123State.lastResult = { ok: false, code: -1, reason: reason, loggedIn: null };
+            showFastLinkToast('提取失败：' + reason, 'warning', 7000);
+            return { ok: false, code: -1, reason: reason };
+        }
+        if (sel.items.length > 1) {
+            showFastLinkToast('当前选中 ' + sel.items.length + ' 项：多选不猜，请只选中一个文件后重试', 'warning', 5000);
+            return { ok: false, code: -1, reason: '多选（' + sel.items.length + ' 项）' };
+        }
+        if (sel.items.length === 0) {
+            const cur = await currentBrowseParentId();
+            if (cur === '') {
+                const reason = '无法识别当前所在的分享目录（站点没有发出可对应的目录请求，或可见列表与目录响应对不上）；请先点进目标目录，或直接选中文件后重试';
+                pan123State.lastResult = { ok: false, code: -1, reason: reason, loggedIn: null };
+                showFastLinkToast('提取失败：' + reason, 'warning', 9000);
+                return { ok: false, code: -1, reason: reason };
+            }
+            showFastLinkToast('未选中文件：按时间字段选择当前目录最新文件', 'info', 2500);
+            return extractDirectLink({ parentFileId: cur, rootPolicy: cur === '0' ? 'prompt' : '' });
+        }
+        const item = sel.items[0];
         if (item.isFolder) {
             showFastLinkToast('选中的是文件夹；直链只能按具体文件提取', 'warning', 4000);
             return { ok: false, code: -1, reason: '选中的是文件夹' };
         }
-        showFastLinkToast('正在定位「' + item.name + '」…', 'info', 2500);
-        const hit = await findShareFileByName(shareKey, item.name, 0, 0, { n: 0 });
-        if (!hit) {
-            const reason = '逐级查找没定位到「' + item.name + '」'
-                + '（分享可能很大，或列目录被服务端限流）；请进入该文件所在目录后重试';
+        const cur = await currentBrowseParentId();
+        if (cur === '') {
+            const reason = '无法识别当前所在的分享目录，不能安全定位选中的「' + item.name + '」；请刷新页面后重试';
             pan123State.lastResult = { ok: false, code: -1, reason: reason, loggedIn: null };
-            showFastLinkToast('提取失败：' + reason, 'error', 6000);
+            showFastLinkToast('提取失败：' + reason, 'warning', 9000);
+            return { ok: false, code: -1, reason: reason };
+        }
+        showFastLinkToast('正在定位「' + item.name + '」…', 'info', 2500);
+        const found = await findShareFileByName(shareKey, item.name, cur, 0, { n: 0, max: PAN123_REQUEST_BUDGET });
+        if (!found.complete) {
+            const reason = '目录扫描不完整（' + (found.reason || '请求/分页上限') + '），无法确认是否只有一个同名文件；请刷新页面后重试';
+            pan123State.lastResult = { ok: false, code: -1, reason: reason, loggedIn: null };
+            showFastLinkToast('提取失败：' + reason, 'warning', 9000);
+            return { ok: false, code: -1, reason: reason };
+        }
+        if (!found.hits.length) {
+            const reason = '当前目录里没找到选中的文件「' + item.name + '」；请刷新页面后重新选中';
+            pan123State.lastResult = { ok: false, code: -1, reason: reason, loggedIn: null };
+            showFastLinkToast('提取失败：' + reason, 'error', 7000);
+            return { ok: false, code: -1, reason: reason };
+        }
+        if (found.hits.length > 1) {
+            const reason = '当前目录里有 ' + found.hits.length + ' 个同名文件「' + item.name + '」，无法确定你选中的是哪一个';
+            pan123State.lastResult = { ok: false, code: -1, reason: reason, loggedIn: null };
+            showFastLinkToast('提取失败：' + reason, 'warning', 7000);
             return { ok: false, code: -1, reason: reason };
         }
         pan123State.shareKey = shareKey;
-        return extractDirectLink({ parentFileId: hit.parentId, onlyName: item.name });
+        return extractDirectLink({ parentFileId: found.hits[0].parentId, onlyName: item.name, onlyFileId: item.fileId || '' });
     }
 
     /** 分享页浮动按钮：只在「恰好选中 1 个文件」时出现 */
@@ -3073,7 +3678,12 @@
      * 桌面版放进表头 .rightInfo 的下载按钮那一组（和站点自己的
      * 「浏览器下载 / 客户端下载」排在一起）；移动版没有这条表头，
      * 退回右下角浮动圆钮。
+     * 1.2.9：DOM 只在“创建”或“目标文件名变化”时写一次，稳定态不碰 DOM。
+     * 1.2.8 每 120ms 无条件重写 innerHTML，MutationObserver 被自己的写入唤醒（自激），
+     * 真实鼠标 mousedown->200ms->mouseup 跨 tick 时 click 被吞。
      */
+    let directLinkTriggerSig = '';
+
     function updateDirectLinkTrigger() {
         if (!isSharePage() || !document.body) return;
         const sel = getShareSelection();
@@ -3082,12 +3692,20 @@
         const inlineBtn = document.getElementById('directlink-inline');
         const wrap = headerRow();
         const right = wrap ? wrap.querySelector('.rightInfo') : null;
+        const sig = show ? ((right ? 'inline|' : 'float|') + sel[0].name) : '';
+        const settled = show
+            ? (right ? !!(inlineBtn && right.contains(inlineBtn)) : !!(floatBtn && document.body.contains(floatBtn)))
+            : (!floatBtn && !inlineBtn);
+        if (sig === directLinkTriggerSig && settled) return;
 
         if (!show) {
             if (floatBtn) floatBtn.remove();
             if (inlineBtn) inlineBtn.remove();
+            directLinkTriggerSig = '';
             return;
         }
+
+        const title = '提取「' + sel[0].name + '」的直链';
 
         if (right) {
             // 桌面版：行内按钮，插到「浏览器下载 / 客户端下载」那一组之后
@@ -3099,10 +3717,13 @@
                 btn.type = 'button';
                 btn.className = 'pan123-inline-btn primary';
                 btn.addEventListener('click', onDirectLinkClick);
+                // 只在创建时写一次结构，后续只改 title/aria-label
+                btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"></path><path d="M7 10l5 5 5-5"></path><path d="M4 19h16"></path></svg><span>提取直链</span>';
             }
-            btn.title = '提取「' + sel[0].name + '」的直链';
-            btn.setAttribute('aria-label', btn.title);
-            btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"></path><path d="M7 10l5 5 5-5"></path><path d="M4 19h16"></path></svg><span>提取直链</span>';
+            if (btn.title !== title) {
+                btn.title = title;
+                btn.setAttribute('aria-label', title);
+            }
             if (!right.contains(btn)) {
                 const anchors = right.querySelectorAll('.client-download-btn');
                 const last = anchors[anchors.length - 1];
@@ -3113,19 +3734,25 @@
                     right.appendChild(btn);
                 }
             }
+            directLinkTriggerSig = sig;
             return;
         }
 
         // 移动版：右下浮动圆钮
         if (inlineBtn) inlineBtn.remove();
-        if (floatBtn && document.body.contains(floatBtn)) return;
-        const el = document.createElement('button');
-        el.id = DIRECTLINK_TRIGGER_ID;
-        el.title = '提取「' + sel[0].name + '」的直链';
-        el.setAttribute('aria-label', el.title);
-        el.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"></path><path d="M7 10l5 5 5-5"></path><path d="M4 19h16"></path></svg>';
-        el.addEventListener('click', onDirectLinkClick);
-        document.body.appendChild(el);
+        let el = floatBtn;
+        if (!el) {
+            el = document.createElement('button');
+            el.id = DIRECTLINK_TRIGGER_ID;
+            el.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"></path><path d="M7 10l5 5 5-5"></path><path d="M4 19h16"></path></svg>';
+            el.addEventListener('click', onDirectLinkClick);
+            document.body.appendChild(el);
+        }
+        if (el.title !== title) {
+            el.title = title;
+            el.setAttribute('aria-label', title);
+        }
+        directLinkTriggerSig = sig;
     }
 
     /** 选中态是 React 重渲染出来的、不冒泡 click；用 MutationObserver + 捕获期 click + 轮询三重兜底 */
@@ -3140,7 +3767,20 @@
             setTimeout(function () { pending = false; tick(); }, 120);
         };
         try {
-            const mo = new MutationObserver(schedule);
+            const isOwnNode = function (n) {
+                return !!(n && n.nodeType === 1 && (n.id === DIRECTLINK_TRIGGER_ID || n.id === 'directlink-inline'));
+            };
+            const mo = new MutationObserver(function (records) {
+                // 只忽略“我们自己插入按钮”这一类 childList；删除/其它变更仍复核。
+                // 1.2.8 不区分来源，自己的 innerHTML 写入会反过来唤醒自己（每 120ms 自激）。
+                if (records && records.length && records.every(function (rec) {
+                    if (rec.type !== 'childList') return false;
+                    const added = Array.prototype.slice.call(rec.addedNodes || []);
+                    const removed = Array.prototype.slice.call(rec.removedNodes || []);
+                    return removed.length === 0 && added.length > 0 && added.every(isOwnNode);
+                })) return;
+                schedule();
+            });
             mo.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'checked'] });
         } catch (e) { }
         document.addEventListener('click', schedule, true);
@@ -4070,7 +4710,7 @@
             showFastLinkToast('直链提取已在设置中关闭', 'warning', 3000);
             return;
         }
-        extractDirectLink({}).catch(function (e) { showFastLinkToast('提取失败：' + e, 'error', 5000); });
+        extractSelectedFileLink().catch(function (e) { showFastLinkToast('提取失败：' + e, 'error', 5000); });
     });
     GM_registerMenuCommand('🔎 下载状态诊断（登录态/流量闸门/直链）', function () {
         diagnoseDownload().catch(function (e) { showFastLinkToast('诊断失败：' + e, 'error', 5000); });
@@ -4082,12 +4722,15 @@
     // 调试/自测入口（供控制台与自动化验收调用）
     try {
         unsafeWindow.__pan123Fix = {
-            version: '1.2.8',
+            version: '1.2.13',
             state: pan123State,
             currentShareKey: currentShareKey,
             buildDownloadUrlFromResponse: buildDownloadUrlFromResponse,
             normalizeDownloadUrl: normalizeDownloadUrl,
             extractDirectLink: extractDirectLink,
+            extractSelectedFileLink: extractSelectedFileLink,
+            currentBrowseParentId: currentBrowseParentId,
+            pan123Nav: pan123Nav,
             diagnoseDownload: diagnoseDownload,
             detectLoginState: detectLoginState,
             fetchTrafficCheck: fetchTrafficCheck,
